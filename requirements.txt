@@ -9,6 +9,12 @@ numpy
 pandas
 scikit-learn
 
+seaborn
+jupyterlab
+jupyter
+scipy
+matplotlib
+
 # tests/linter
 black
 coverage
