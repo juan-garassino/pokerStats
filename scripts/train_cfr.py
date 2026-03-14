@@ -64,8 +64,11 @@ def _render_cfr_stats(stats: dict) -> str:
     if exploit is not None:
         exploit_str = f"  exploit={exploit:+.4f} BB/hand"
 
+    elapsed = stats.get("elapsed", 0)
+    elapsed_str = f"{elapsed:.0f}s" if elapsed < 3600 else f"{elapsed/3600:.1f}h"
+
     line2 = (
-        f"    {GRAY}{rate:.0f} iter/s{exploit_str}  "
+        f"    {GRAY}{rate:.1f} iter/s  {elapsed_str}{exploit_str}  "
         f"[{pct:.0f}%]{RESET}"
     )
     return f"{line1}\n{line2}"
@@ -216,6 +219,7 @@ def phase_solve(
             "iteration": solver.iterations,
             "info_sets": len(solver.info_sets),
             "iter_per_sec": rate,
+            "elapsed": elapsed,
             "phase_pct": pct,
             "exploitability": last_exploit,
         }

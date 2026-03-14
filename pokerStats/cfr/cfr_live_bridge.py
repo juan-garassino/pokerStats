@@ -97,28 +97,29 @@ class CFRDecisionEngine:
         num_opponents: int,
     ) -> np.ndarray:
         """Build observation vector for PPO component."""
+        from pokerStats.rl.poker_env import MAX_PLAYERS
         v = np.zeros(OBS_DIM, dtype=np.float32)
         v[0:52] = cards_to_onehot(hole_cards)
         v[52:104] = cards_to_onehot(community_cards)
 
         max_stack = 400.0
         v[104] = hero_stack / max_stack
-        v[110] = call_amount / max_stack
-        v[116] = 1.0  # hero active
+        v[113] = call_amount / max_stack
+        v[122] = 1.0  # hero active
 
-        for i in range(min(num_opponents, 5)):
-            v[117 + i] = 1.0
+        for i in range(min(num_opponents, MAX_PLAYERS - 1)):
+            v[123 + i] = 1.0
 
-        pos_map = {"btn": 0, "sb": 1, "bb": 2, "utg": 3, "mp": 4, "co": 5, "hj": 5}
-        v[122] = pos_map.get(str(position).lower(), 3) / 6.0
+        pos_map = {"btn": 0, "sb": 1, "bb": 2, "utg": 3, "mp": 4, "co": 5, "hj": 6}
+        v[131] = pos_map.get(str(position).lower(), 3) / MAX_PLAYERS
 
-        v[128] = pot / max_stack
-        v[129] = call_amount / max_stack
-        v[130] = call_amount / max_stack
-        v[131] = num_opponents / 5.0
+        v[140] = pot / max_stack
+        v[141] = call_amount / max_stack
+        v[142] = call_amount / max_stack
+        v[143] = num_opponents / MAX_PLAYERS
 
         street_idx = STREETS.index(street) if street in STREETS else 0
-        v[132 + street_idx] = 1.0
+        v[144 + street_idx] = 1.0
 
         return v
 

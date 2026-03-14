@@ -65,6 +65,11 @@ CFG = {
     "phase2_hands":     200_000,
     "phase3_hands":     70_000,
 
+    # CFR distillation coefficients per phase (only used when blueprint_teacher is set)
+    "cfr_coef_phase1":  1.0,   # pre-train: heavy CFR supervision
+    "cfr_coef_phase2":  0.3,   # self-play: blend with PPO
+    "cfr_coef_phase3":  0.1,   # archetypes: mostly exploit, GTO floor
+
     # Checkpointing
     "save_dir":         "checkpoints",
     "save_freq":        10000,
@@ -190,9 +195,13 @@ class MultiAgentTrainer:
     """
     All 6 seats learn with shared weights via one AlphaPokerNet.
     Each seat maintains its own rollout buffer and opponent history.
+
+    If blueprint_teacher is provided, CFR distillation targets are
+    computed each step and added to the rollout buffer.
     """
-    def __init__(self, cfg: dict = CFG):
+    def __init__(self, cfg: dict = CFG, blueprint_teacher=None):
         self.cfg = cfg
+        self.blueprint_teacher = blueprint_teacher
         self.env = PokerEnv(
             num_players    = cfg["num_players"],
             starting_stack = cfg["starting_stack"],
@@ -363,6 +372,13 @@ class MultiAgentTrainer:
             for s in seats:
                 self._scripted_seats[s] = ScriptedAgent(random.choice(styles))
 
+    def _get_cfr_coef(self, phase: int) -> float:
+        """Get the CFR distillation coefficient for the current phase."""
+        if self.blueprint_teacher is None:
+            return 0.0
+        key = f"cfr_coef_phase{phase}"
+        return self.cfg.get(key, 0.0)
+
     def _run_hand(self, phase: int) -> dict:
         obs = self.env.reset()
         self.recorder.reset()
@@ -375,6 +391,9 @@ class MultiAgentTrainer:
 
         self._prev_potential = {i: 0.0 for i in range(self.num_players)}
         self._assign_seat_agents()
+
+        # CFR action history for blueprint lookup (shared across all seats)
+        cfr_action_history = ()
 
         step_count = 0
         while not done and step_count < max_steps:
@@ -441,19 +460,36 @@ class MultiAgentTrainer:
 
                 reward = raw_reward + shaping * 0.5
 
+                # CFR distillation target
+                cfr_target = None
+                has_cfr = False
+                if self.blueprint_teacher is not None:
+                    hole = self.env.players[pidx].hole_cards
+                    community = list(self.env.community)
+                    cfr_target, has_cfr = self.blueprint_teacher.get_target(
+                        hole, community, cfr_action_history
+                    )
+
                 self.buffers[pidx].add(
                     o, action, raise_frac, log_prob, reward, value,
-                    float(done), mask, opp_events, opp_masks
+                    float(done), mask, opp_events, opp_masks,
+                    cfr_target=cfr_target, has_cfr=has_cfr,
                 )
                 self.total_steps += 1
 
+                # Map taken action to CFR space and append to history
+                if self.blueprint_teacher is not None:
+                    cfr_action_history = cfr_action_history + (action,)
+
                 # PPO update when buffer is full
+                cfr_coef = self._get_cfr_coef(phase)
                 if self.buffers[pidx].full:
                     metrics = self.agent.update(
                         self.buffers[pidx],
                         ppo_epochs=self.cfg["ppo_epochs"],
                         batch_size=self.cfg["batch_size"],
                         hand_num=self.hand_num,
+                        cfr_coef=cfr_coef,
                     )
                     self.last_metrics = metrics
                     self.ppo_updates += 1
@@ -525,6 +561,13 @@ class MultiAgentTrainer:
         total = self.cfg['phase1_hands'] + self.cfg['phase2_hands'] + self.cfg['phase3_hands']
         print(f"  Total hands: {total:,}")
         print(f"  Seats: {self.num_players} (all learning, shared weights)")
+        if self.blueprint_teacher is not None:
+            print(f"  CFR distillation: ENABLED (blueprint loaded)")
+            print(f"    Phase 1 cfr_coef={self.cfg.get('cfr_coef_phase1', 1.0)}")
+            print(f"    Phase 2 cfr_coef={self.cfg.get('cfr_coef_phase2', 0.3)}")
+            print(f"    Phase 3 cfr_coef={self.cfg.get('cfr_coef_phase3', 0.1)}")
+        else:
+            print(f"  CFR distillation: disabled (pure PPO)")
         print(f"{dline}\n")
 
         phase_schedule = [
@@ -623,9 +666,19 @@ def main():
     parser.add_argument("--resume", default=None, help="Resume from checkpoint path")
     parser.add_argument("--phase",  type=int, default=None, help="Start at specific phase")
     parser.add_argument("--render", action="store_true", help="Show Unicode table every hand")
+    parser.add_argument("--blueprint", default=None,
+                        help="Path to CFR blueprint .npz for distillation")
+    parser.add_argument("--abstraction", default=None,
+                        help="Path to hand abstraction .npz for distillation")
     args = parser.parse_args()
 
-    trainer = MultiAgentTrainer(CFG)
+    teacher = None
+    if args.blueprint and args.abstraction:
+        from pokerStats.cfr.distillation import BlueprintTeacher
+        teacher = BlueprintTeacher(args.blueprint, args.abstraction)
+        print(f"  Loaded blueprint teacher for CFR distillation")
+
+    trainer = MultiAgentTrainer(CFG, blueprint_teacher=teacher)
 
     if args.resume:
         trainer.agent.load(args.resume)

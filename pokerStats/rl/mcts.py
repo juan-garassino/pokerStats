@@ -174,12 +174,12 @@ class PokerMCTS:
         if is_alpha and opp_events is not None:
             opp_ev_t = torch.from_numpy(opp_events).unsqueeze(0)
             opp_mk_t = torch.from_numpy(opp_masks).unsqueeze(0)
-            logits, _, _, value, _, _, range_pred = self.net(
+            logits, _, _, value, _, _, range_pred, _ = self.net(
                 obs_t, mask_t, opp_ev_t, opp_mk_t
             )
             range_np = range_pred[0].numpy()
         elif is_alpha:
-            logits, _, _, value, _, _, range_pred = self.net(obs_t, mask_t)
+            logits, _, _, value, _, _, range_pred, _ = self.net(obs_t, mask_t)
             range_np = range_pred[0].numpy()
         else:
             logits, _, _, value = self.net(obs_t, mask_t)

@@ -56,7 +56,7 @@ def test_alpha_poker_net_forward():
     opp_events = torch.randn(batch, 5, MAX_SEQ_LEN, EVENT_DIM)
     opp_masks = torch.zeros(batch, 5, MAX_SEQ_LEN, dtype=torch.bool)
 
-    logits, ra, rb, value, latents, card_preds, range_pred = net(
+    logits, ra, rb, value, latents, card_preds, range_pred, cfr_logits = net(
         obs, mask, opp_events, opp_masks
     )
 
@@ -79,7 +79,7 @@ def test_alpha_poker_net_no_opp():
     obs = torch.randn(batch, OBS_DIM)
     mask = torch.ones(batch, NUM_ACTIONS, dtype=torch.bool)
 
-    logits, ra, rb, value, latents, card_preds, range_pred = net(obs, mask)
+    logits, ra, rb, value, latents, card_preds, range_pred, cfr_logits = net(obs, mask)
     assert logits.shape == (batch, NUM_ACTIONS)
 
 

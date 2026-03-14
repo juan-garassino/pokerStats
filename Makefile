@@ -48,24 +48,107 @@ eval-rl:
 eval-rl-legacy:
 	python scripts/eval_rl.py --legacy
 
-# Colab training (configurable hand counts)
+# Colab training (configurable hand counts + table size)
 PHASE1_HANDS ?= 20000
 PHASE2_HANDS ?= 50000
 PHASE3_HANDS ?= 20000
+NUM_PLAYERS ?= 6
 
 train-colab:
+ifeq ($(USE_CFR),1)
 	python -c "from pokerStats.rl.self_play_trainer import MultiAgentTrainer, CFG; \
+		from pokerStats.cfr.distillation import BlueprintTeacher; \
+		CFG['num_players']=$(NUM_PLAYERS); \
+		CFG['phase1_hands']=$(PHASE1_HANDS); \
+		CFG['phase2_hands']=$(PHASE2_HANDS); \
+		CFG['phase3_hands']=$(PHASE3_HANDS); \
+		CFG['render_every']=999999; \
+		teacher = BlueprintTeacher('$(CFR_BLUEPRINT)', '$(CFR_ABSTRACTION)'); \
+		MultiAgentTrainer(CFG, blueprint_teacher=teacher).train()"
+else
+	python -c "from pokerStats.rl.self_play_trainer import MultiAgentTrainer, CFG; \
+		CFG['num_players']=$(NUM_PLAYERS); \
 		CFG['phase1_hands']=$(PHASE1_HANDS); \
 		CFG['phase2_hands']=$(PHASE2_HANDS); \
 		CFG['phase3_hands']=$(PHASE3_HANDS); \
 		CFG['render_every']=999999; \
 		MultiAgentTrainer(CFG).train()"
+endif
 
 train-colab-quick:
 	$(MAKE) train-colab PHASE1_HANDS=5000 PHASE2_HANDS=10000 PHASE3_HANDS=5000
 
 train-colab-full:
 	$(MAKE) train-colab PHASE1_HANDS=50000 PHASE2_HANDS=200000 PHASE3_HANDS=50000
+
+# Table size presets — same network, different player counts
+train-colab-2max:
+	$(MAKE) train-colab NUM_PLAYERS=2
+
+train-colab-3max:
+	$(MAKE) train-colab NUM_PLAYERS=3
+
+train-colab-6max:
+	$(MAKE) train-colab NUM_PLAYERS=6
+
+train-colab-8max:
+	$(MAKE) train-colab NUM_PLAYERS=8
+
+# ── Full hybrid agent training (PPO + CFR) ──────────────
+# Best agent for a given table size — runs both pipelines
+train-hybrid:
+	$(MAKE) cfr-colab-full
+	$(MAKE) train-colab-full NUM_PLAYERS=$(NUM_PLAYERS)
+
+train-hybrid-quick:
+	$(MAKE) cfr-colab-quick
+	$(MAKE) train-colab-quick NUM_PLAYERS=$(NUM_PLAYERS)
+
+train-hybrid-6max:
+	$(MAKE) train-hybrid NUM_PLAYERS=6
+
+train-hybrid-8max:
+	$(MAKE) train-hybrid NUM_PLAYERS=8
+
+# ── Unified training (CFR distillation into single network) ──
+# Trains CFR blueprint first, then PPO with distillation loss
+USE_CFR ?= 0
+CFR_BLUEPRINT ?= checkpoints/cfr/blueprint.npz
+CFR_ABSTRACTION ?= checkpoints/cfr/abstraction.npz
+
+train-unified:
+	$(MAKE) cfr-colab-full
+	$(MAKE) train-colab-full NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1
+
+train-unified-quick:
+	$(MAKE) cfr-colab-quick
+	$(MAKE) train-colab-quick NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1
+
+train-unified-6max:
+	$(MAKE) train-unified NUM_PLAYERS=6
+
+train-unified-8max:
+	$(MAKE) train-unified NUM_PLAYERS=8
+
+# ── Colab one-shot: fresh training from scratch ──────────
+# Single command that does everything: CFR → PPO+distillation
+# Quick (~30 min on Colab GPU)
+train-unified-colab-quick:
+	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=5000 CFR_RENDER=1000 CFR_LOG=500
+	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
+		PHASE1_HANDS=5000 PHASE2_HANDS=10000 PHASE3_HANDS=5000
+
+# Medium (~2-3 hours on Colab GPU)
+train-unified-colab:
+	$(MAKE) cfr-train CFR_BUCKETS=50 CFR_SAMPLES=1000 CFR_ITERS=50000 CFR_RENDER=10000 CFR_LOG=5000
+	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
+		PHASE1_HANDS=20000 PHASE2_HANDS=50000 PHASE3_HANDS=20000
+
+# Full (~6-8 hours on Colab GPU)
+train-unified-colab-full:
+	$(MAKE) cfr-train CFR_BUCKETS=200 CFR_SAMPLES=10000 CFR_ITERS=500000 CFR_RENDER=50000 CFR_LOG=25000
+	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
+		PHASE1_HANDS=50000 PHASE2_HANDS=200000 PHASE3_HANDS=50000
 
 # Watch random agent play 10 hands (no checkpoint needed)
 demo:
@@ -142,13 +225,13 @@ cfr-resume:
 
 # Presets (all include rendered demo hands)
 cfr-colab-quick:
-	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=1000 CFR_RENDER=500 CFR_LOG=500
+	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=5000 CFR_RENDER=1000 CFR_LOG=500
 
 cfr-colab:
-	$(MAKE) cfr-train CFR_BUCKETS=50 CFR_SAMPLES=1000 CFR_ITERS=5000 CFR_RENDER=500 CFR_LOG=500
+	$(MAKE) cfr-train CFR_BUCKETS=50 CFR_SAMPLES=1000 CFR_ITERS=50000 CFR_RENDER=10000 CFR_LOG=5000
 
 cfr-colab-full:
-	$(MAKE) cfr-train CFR_BUCKETS=200 CFR_SAMPLES=10000 CFR_ITERS=100000 CFR_RENDER=500 CFR_LOG=500
+	$(MAKE) cfr-train CFR_BUCKETS=200 CFR_SAMPLES=10000 CFR_ITERS=500000 CFR_RENDER=50000 CFR_LOG=25000
 
 # Test Kuhn poker convergence (instant sanity check)
 cfr-test-kuhn:

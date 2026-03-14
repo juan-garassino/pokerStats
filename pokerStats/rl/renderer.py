@@ -77,6 +77,8 @@ def equity_bar(equity: float, width: int = 10) -> str:
 
 
 # Position labels by seat offset from dealer
+_POS_LABELS_9 = ["BTN", "SB", "BB", "UTG", "UTG1", "UTG2", "MP", "HJ", "CO"]
+_POS_LABELS_8 = ["BTN", "SB", "BB", "UTG", "UTG1", "MP", "HJ", "CO"]
 _POS_LABELS_6 = ["BTN", "SB", "BB", "UTG", "MP", "CO"]
 _POS_LABELS_3 = ["BTN", "SB", "BB"]
 _POS_LABELS_2 = ["BTN", "BB"]
@@ -88,8 +90,12 @@ def _pos_label(seat_idx: int, dealer_idx: int, num_players: int) -> str:
         labels = _POS_LABELS_2
     elif num_players <= 3:
         labels = _POS_LABELS_3
-    else:
+    elif num_players <= 6:
         labels = _POS_LABELS_6
+    elif num_players <= 8:
+        labels = _POS_LABELS_8
+    else:
+        labels = _POS_LABELS_9
     offset = (seat_idx - dealer_idx) % num_players
     if offset < len(labels):
         return labels[offset]

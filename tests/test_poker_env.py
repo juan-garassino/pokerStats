@@ -10,7 +10,7 @@ def test_obs_shape():
     """Observation vectors have the correct dimension."""
     env = PokerEnv(num_players=6)
     obs = env.reset()
-    assert OBS_DIM == 148
+    assert OBS_DIM == 160
     for i in range(6):
         assert obs[i].shape == (OBS_DIM,), f"Player {i} obs shape mismatch"
 
@@ -123,13 +123,13 @@ def test_draw_potential():
 
 
 def test_obs_has_hand_strength():
-    """Obs vector slots 143-144 contain hand strength and draw potential."""
+    """Obs vector slots 155-156 contain hand strength and draw potential."""
     env = PokerEnv(num_players=3)
     obs = env.reset()
     for i in range(3):
         # Hand strength should be between 0 and 1
-        assert 0.0 <= obs[i][143] <= 1.0
-        assert 0.0 <= obs[i][144] <= 1.0
+        assert 0.0 <= obs[i][155] <= 1.0
+        assert 0.0 <= obs[i][156] <= 1.0
 
 
 def test_raise_curve_boundaries():
@@ -156,3 +156,22 @@ def test_continuous_raise_in_step():
     if Action.RAISE in legal:
         obs, rewards, done, info = env.step(Action.RAISE, 0.3)
         assert isinstance(rewards, dict)
+
+
+def test_multi_table_sizes():
+    """Same OBS_DIM works for 2, 3, 6, and 8 players."""
+    for n in [2, 3, 6, 8]:
+        env = PokerEnv(num_players=n)
+        obs = env.reset()
+        for i in range(n):
+            assert obs[i].shape == (OBS_DIM,), f"{n}-max: player {i} obs shape wrong"
+
+        # Play a hand to completion
+        done = False
+        steps = 0
+        while not done and steps < 200:
+            legal = env.legal_actions()
+            obs, rewards, done, _ = env.step(legal[0])
+            steps += 1
+        assert done, f"{n}-max hand did not complete"
+        assert abs(sum(rewards.values())) < 0.01, f"{n}-max rewards not zero-sum"

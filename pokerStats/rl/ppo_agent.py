@@ -19,8 +19,11 @@ import torch.nn.functional as F
 from torch.distributions import Categorical, Beta
 from typing import Optional
 
-from .poker_env import NUM_ACTIONS, OBS_DIM, Action
+from .poker_env import NUM_ACTIONS, OBS_DIM, MAX_PLAYERS, Action
 from .opponent_encoder import OpponentEncoder, EVENT_DIM, MAX_SEQ_LEN, LATENT_DIM
+
+# CFR action count — must match pokerStats.cfr.cfr_solver.NUM_CFR_ACTIONS
+NUM_CFR_ACTIONS = 7
 
 
 # ── Network architecture ──────────────────────────────────────────────────────
@@ -128,14 +131,14 @@ class AlphaPokerNet(nn.Module):
     """
     Actor-Critic with opponent modeling, auxiliary heads, and range prediction.
 
-    Input: obs (145) + opponent latents (5 × 32 = 160) → fused (305)
+    Input: obs (160) + opponent latents (8 × 32 = 256) → fused (416)
     Trunk: 3 ResBlocks (256 hidden)
     Heads: actor (5), raise (Beta α,β), critic (1)
-    Aux:   card predictor (52/opp), action predictor (5/opp), range (5×52)
-    ~200K params total.
+    Aux:   card predictor (52/opp), action predictor (5/opp), range (8×52)
+    Supports 2-9 players. Empty seats get zero latents.
     """
     def __init__(self, obs_dim: int = OBS_DIM, hidden: int = 256,
-                 num_actions: int = NUM_ACTIONS, num_opponents: int = 5,
+                 num_actions: int = NUM_ACTIONS, num_opponents: int = MAX_PLAYERS - 1,
                  latent_dim: int = LATENT_DIM):
         super().__init__()
         self.num_opponents = num_opponents
@@ -182,6 +185,13 @@ class AlphaPokerNet(nn.Module):
         # Game context projection for action predictor
         self.game_ctx_proj = nn.Linear(hidden, 64)
         self.range_head_proj = nn.Linear(hidden, num_opponents * 52)
+
+        # CFR distillation head (predicts blueprint strategy from trunk)
+        self.cfr_head = nn.Sequential(
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, NUM_CFR_ACTIONS),
+        )
 
         # Init
         nn.init.orthogonal_(self.actor[-1].weight, gain=0.01)
@@ -254,7 +264,9 @@ class AlphaPokerNet(nn.Module):
         game_ctx = F.relu(self.game_ctx_proj(x))
         range_pred = torch.sigmoid(self.range_head_proj(x))
 
-        return logits, raise_alpha, raise_beta, value, latents, card_preds, range_pred
+        cfr_logits = self.cfr_head(x)
+
+        return logits, raise_alpha, raise_beta, value, latents, card_preds, range_pred, cfr_logits
 
     def forward_with_trunk(self, obs, legal_mask=None, opp_events=None, opp_masks=None):
         """Forward pass that also returns trunk output for action prediction."""
@@ -285,7 +297,9 @@ class AlphaPokerNet(nn.Module):
         game_ctx = F.relu(self.game_ctx_proj(x))
         range_pred = torch.sigmoid(self.range_head_proj(x))
 
-        return logits, raise_alpha, raise_beta, value, latents, card_preds, range_pred, x
+        cfr_logits = self.cfr_head(x)
+
+        return logits, raise_alpha, raise_beta, value, latents, card_preds, range_pred, cfr_logits, x
 
     def act(self, obs: torch.Tensor, legal_mask: Optional[torch.Tensor] = None,
             opp_events: Optional[torch.Tensor] = None,
@@ -295,7 +309,7 @@ class AlphaPokerNet(nn.Module):
         Sample action and raise sizing.
         Returns (action, raise_frac, log_prob, value, entropy).
         """
-        logits, raise_alpha, raise_beta, value, latents, _, _ = self.forward(
+        logits, raise_alpha, raise_beta, value, latents, _, _, _ = self.forward(
             obs, legal_mask, opp_events, opp_masks
         )
 
@@ -324,7 +338,7 @@ class AlphaPokerNet(nn.Module):
 class RolloutBuffer:
     def __init__(self, capacity: int, obs_dim: int = OBS_DIM,
                  num_actions: int = NUM_ACTIONS,
-                 num_opponents: int = 5, max_seq_len: int = MAX_SEQ_LEN,
+                 num_opponents: int = MAX_PLAYERS - 1, max_seq_len: int = MAX_SEQ_LEN,
                  event_dim: int = EVENT_DIM):
         self.capacity    = capacity
         self.obs         = np.zeros((capacity, obs_dim),      dtype=np.float32)
@@ -347,11 +361,16 @@ class RolloutBuffer:
         self.next_actions   = np.zeros((capacity, num_opponents), dtype=np.int64)
         self.has_next_action = np.zeros((capacity, num_opponents), dtype=bool)
 
+        # CFR distillation targets
+        self.cfr_targets    = np.zeros((capacity, NUM_CFR_ACTIONS), dtype=np.float32)
+        self.has_cfr_target = np.zeros(capacity, dtype=bool)
+
         self.ptr  = 0
         self.full = False
 
     def add(self, obs, action, raise_frac, log_prob, reward, value, done,
-            legal_mask, opp_events=None, opp_masks=None):
+            legal_mask, opp_events=None, opp_masks=None,
+            cfr_target=None, has_cfr=False):
         i = self.ptr % self.capacity
         self.obs[i]         = obs
         self.actions[i]     = action
@@ -365,6 +384,11 @@ class RolloutBuffer:
             self.opp_events[i] = opp_events
         if opp_masks is not None:
             self.opp_masks[i] = opp_masks
+        if cfr_target is not None:
+            self.cfr_targets[i] = cfr_target
+            self.has_cfr_target[i] = has_cfr
+        else:
+            self.has_cfr_target[i] = False
         self.ptr += 1
         if self.ptr >= self.capacity:
             self.full = True
@@ -410,6 +434,8 @@ class RolloutBuffer:
                 torch.FloatTensor(self.values[b]),
                 torch.LongTensor(self.next_actions[b]),
                 torch.BoolTensor(self.has_next_action[b]),
+                torch.FloatTensor(self.cfr_targets[b]),
+                torch.BoolTensor(self.has_cfr_target[b]),
             )
 
     def reset(self):
@@ -431,7 +457,7 @@ class PPOAgent:
         max_grad_norm:float = 0.5,
         device:       str   = "auto",
         use_alpha:    bool  = False,
-        num_opponents:int   = 5,
+        num_opponents:int   = MAX_PLAYERS - 1,
         aux_card_coef:  float = 0.5,
         aux_action_coef:float = 0.3,
         aux_range_coef: float = 0.3,
@@ -502,11 +528,11 @@ class PPOAgent:
         if self.use_alpha and opp_events is not None:
             opp_ev_t = torch.from_numpy(opp_events).unsqueeze(0)
             opp_mk_t = torch.from_numpy(opp_masks).unsqueeze(0)
-            logits, raise_alpha, raise_beta, value, _, _, _ = self._cpu_net(
+            logits, raise_alpha, raise_beta, value, _, _, _, _ = self._cpu_net(
                 obs_t, mask_t, opp_ev_t, opp_mk_t
             )
         elif self.use_alpha:
-            logits, raise_alpha, raise_beta, value, _, _, _ = self._cpu_net(
+            logits, raise_alpha, raise_beta, value, _, _, _, _ = self._cpu_net(
                 obs_t, mask_t
             )
         else:
@@ -561,10 +587,12 @@ class PPOAgent:
             self._ret_var += (delta * delta2 - self._ret_var) / self._ret_count
 
     def update(self, buffer: RolloutBuffer, ppo_epochs: int = 4,
-               batch_size: int = 256, hand_num: int = 0) -> dict:
-        """Run PPO update with optional auxiliary losses. Returns metrics."""
+               batch_size: int = 256, hand_num: int = 0,
+               cfr_coef: float = 0.0) -> dict:
+        """Run PPO update with optional auxiliary + CFR distillation losses. Returns metrics."""
         total_loss = total_policy = total_value = total_entropy = 0.0
         total_aux_card = total_aux_range = total_aux_action = 0.0
+        total_cfr_loss = 0.0
         n_updates = 0
 
         warmup = self._aux_warmup(hand_num) if self.use_alpha else 0.0
@@ -574,18 +602,21 @@ class PPOAgent:
                 if self.use_alpha:
                     obs, actions, raise_fracs, old_log_probs, returns, \
                         advantages, masks, opp_ev, opp_mk, sd_cards, has_sd, \
-                        old_values, next_actions, has_next_act = batch
+                        old_values, next_actions, has_next_act, \
+                        cfr_targets_b, has_cfr_b = batch
                     obs, actions, raise_fracs, old_log_probs, returns, \
                         advantages, masks, opp_ev, opp_mk, sd_cards, has_sd, \
-                        old_values, next_actions, has_next_act = (
+                        old_values, next_actions, has_next_act, \
+                        cfr_targets_b, has_cfr_b = (
                         t.to(self.device) for t in
                         (obs, actions, raise_fracs, old_log_probs, returns,
                          advantages, masks, opp_ev, opp_mk, sd_cards, has_sd,
-                         old_values, next_actions, has_next_act)
+                         old_values, next_actions, has_next_act,
+                         cfr_targets_b, has_cfr_b)
                     )
 
                     logits, raise_alpha, raise_beta, values, latents, \
-                        card_preds, range_pred, x = self.net.forward_with_trunk(obs, masks, opp_ev, opp_mk)
+                        card_preds, range_pred, cfr_logits, x = self.net.forward_with_trunk(obs, masks, opp_ev, opp_mk)
                 else:
                     obs, actions, raise_fracs, old_log_probs, returns, \
                         advantages, masks, *_ = batch
@@ -681,6 +712,18 @@ class PPOAgent:
                         self.aux_action_coef * aux_action_loss
                     )
 
+                # CFR distillation loss (AlphaPokerNet only)
+                cfr_loss = torch.tensor(0.0, device=self.device)
+                if self.use_alpha and cfr_coef > 0 and has_cfr_b.any():
+                    cfr_pred = F.log_softmax(cfr_logits[has_cfr_b], dim=-1)
+                    cfr_tgt = cfr_targets_b[has_cfr_b]
+                    # Clamp targets to valid probability distribution
+                    cfr_tgt = cfr_tgt.clamp(min=1e-8)
+                    cfr_tgt = cfr_tgt / cfr_tgt.sum(dim=-1, keepdim=True)
+                    cfr_loss = F.kl_div(cfr_pred, cfr_tgt, reduction='batchmean',
+                                        log_target=False)
+                    loss = loss + cfr_coef * cfr_loss
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
@@ -693,6 +736,7 @@ class PPOAgent:
                 total_aux_card += aux_card_loss.item()
                 total_aux_range += aux_range_loss.item()
                 total_aux_action += aux_action_loss.item()
+                total_cfr_loss += cfr_loss.item()
                 n_updates     += 1
 
         self.train_steps += 1
@@ -709,6 +753,7 @@ class PPOAgent:
             metrics["aux_card_loss"]  = total_aux_card  / max(n_updates, 1)
             metrics["aux_range_loss"] = total_aux_range / max(n_updates, 1)
             metrics["aux_action_loss"] = total_aux_action / max(n_updates, 1)
+            metrics["cfr_loss"]       = total_cfr_loss  / max(n_updates, 1)
 
         return metrics
 

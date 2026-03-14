@@ -11,6 +11,7 @@ from .blueprint import BlueprintStrategy
 from .subgame_solver import SubgameSolver
 from .hybrid_agent import HybridAgent
 from .cfr_live_bridge import CFRDecisionEngine
+from .distillation import BlueprintTeacher
 
 __all__ = [
     "PreflopAbstraction", "PostflopAbstraction", "HandAbstraction",
@@ -19,4 +20,5 @@ __all__ = [
     "SubgameSolver",
     "HybridAgent",
     "CFRDecisionEngine",
+    "BlueprintTeacher",
 ]

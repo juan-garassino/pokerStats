@@ -70,21 +70,25 @@ def raise_frac_to_amount(frac: float, min_raise: float, max_raise: float) -> flo
     return min_raise + curved * (max_raise - min_raise)
 
 # ── Observation space layout ──────────────────────────────────────────────────
+# Padded to MAX_PLAYERS=9 so one network works for 2, 3, 6, or 8 players.
+# Empty seats get zeros — the agent learns to ignore them.
+#
 # [0:52]    hole cards (one-hot, 52 bits)
 # [52:104]  community cards (one-hot, 52 bits)
-# [104:110] per-player stack normalized (6 players)
-# [110:116] per-player current bet normalized
-# [116:122] per-player active flags
-# [122:128] per-player position (dealer=0,SB=1,BB=2... normalized)
-# [128:132] pot, call_amount, min_raise, num_active (normalized)
-# [132:136] street one-hot [preflop, flop, turn, river]
-# [136:143] last 7 actions normalized
-# [143]     hand strength (0=trash, 1=nuts)
-# [144]     draw potential (0=none, 1=strong draw)
-# [145]     raises_this_street / max_raises (aggression level)
-# [146]     facing_raise (1.0 if must call a raise)
-# [147]     pot_odds (call / (pot + call), 0 if no bet)
-OBS_DIM = 148
+# [104:113] per-player stack normalized (9 slots, padded)
+# [113:122] per-player current bet normalized
+# [122:131] per-player active flags
+# [131:140] per-player position (dealer=0,SB=1,BB=2... normalized)
+# [140:144] pot, call_amount, min_raise, num_active (normalized)
+# [144:148] street one-hot [preflop, flop, turn, river]
+# [148:155] last 7 actions normalized
+# [155]     hand strength (0=trash, 1=nuts)
+# [156]     draw potential (0=none, 1=strong draw)
+# [157]     raises_this_street / max_raises (aggression level)
+# [158]     facing_raise (1.0 if must call a raise)
+# [159]     pot_odds (call / (pot + call), 0 if no bet)
+MAX_PLAYERS = 9
+OBS_DIM = 160
 
 STREETS = ["preflop", "flop", "turn", "river"]
 
@@ -645,59 +649,61 @@ class PokerEnv:
         # [52:104] community cards
         v[52:104] = cards_to_onehot(self.community)
 
-        # [104:110] normalized stacks
+        # Player slots padded to MAX_PLAYERS=9 (empty seats stay zero)
         max_stack = self.starting_stack * 2
+
+        # [104:113] normalized stacks
         for i, pl in enumerate(self.players):
             v[104+i] = pl.stack / max_stack
 
-        # [110:116] normalized current bets
+        # [113:122] normalized current bets
         for i, pl in enumerate(self.players):
-            v[110+i] = pl.current_bet / max_stack
+            v[113+i] = pl.current_bet / max_stack
 
-        # [116:122] active flags
+        # [122:131] active flags
         for i, pl in enumerate(self.players):
-            v[116+i] = float(not pl.folded and not pl.all_in)
+            v[122+i] = float(not pl.folded and not pl.all_in)
 
-        # [122:128] positions (dealer=0, normalized)
+        # [131:140] positions (dealer=0, normalized)
         for i in range(self.num_players):
             pos = (i - self.dealer_idx) % self.num_players
-            v[122+i] = pos / self.num_players
+            v[131+i] = pos / self.num_players
 
-        # [128:132] game scalars
-        v[128] = self.pot / max_stack
-        v[129] = self._call_amount(player_idx) / max_stack
-        v[130] = self.last_bet / max_stack
-        v[131] = sum(1 for pl in self.players if not pl.folded) / self.num_players
+        # [140:144] game scalars
+        v[140] = self.pot / max_stack
+        v[141] = self._call_amount(player_idx) / max_stack
+        v[142] = self.last_bet / max_stack
+        v[143] = sum(1 for pl in self.players if not pl.folded) / MAX_PLAYERS
 
-        # [132:136] street one-hot
-        v[132 + self.street_idx] = 1.0
+        # [144:148] street one-hot
+        v[144 + self.street_idx] = 1.0
 
-        # [136:143] last 7 actions (action type normalized within 7 slots)
+        # [148:155] last 7 actions (action type normalized within 7 slots)
         recent = self._action_ids[-7:]
         for j, a in enumerate(recent):
-            v[136 + j] = a / NUM_ACTIONS
+            v[148 + j] = a / NUM_ACTIONS
 
-        # [143-144] hand strength + draw potential (cached per player per street)
+        # [155-156] hand strength + draw potential (cached per player per street)
         cache_key = (player_idx, self.street_idx)
         if cache_key not in self._hs_cache:
             self._hs_cache[cache_key] = (
                 hand_strength(p.hole_cards, self.community),
                 draw_potential(p.hole_cards, self.community),
             )
-        v[143], v[144] = self._hs_cache[cache_key]
+        v[155], v[156] = self._hs_cache[cache_key]
 
-        # [145] raises this street (normalized by max_raises)
-        v[145] = self.raises_this_street / max(self.max_raises, 1)
+        # [157] raises this street (normalized by max_raises)
+        v[157] = self.raises_this_street / max(self.max_raises, 1)
 
-        # [146] facing a raise (1.0 if call_amount > 0 and there's been a raise)
+        # [158] facing a raise (1.0 if call_amount > 0 and there's been a raise)
         call_amt = self._call_amount(player_idx)
-        v[146] = float(call_amt > 0 and self.raises_this_street > 0)
+        v[158] = float(call_amt > 0 and self.raises_this_street > 0)
 
-        # [147] pot odds: call / (pot + call) — key for raise/call/fold decisions
+        # [159] pot odds: call / (pot + call) — key for raise/call/fold decisions
         if call_amt > 0:
-            v[147] = call_amt / (self.pot + call_amt)
+            v[159] = call_amt / (self.pot + call_amt)
         else:
-            v[147] = 0.0
+            v[159] = 0.0
 
         return v
 
