@@ -8,7 +8,10 @@ for integration with the live autonomous agent.
 import numpy as np
 from dataclasses import dataclass
 
-from .poker_env import Action, NUM_ACTIONS, OBS_DIM, CARD_IDX, cards_to_onehot, STREETS
+from .poker_env import (
+    Action, NUM_ACTIONS, OBS_DIM, CARD_IDX, cards_to_onehot, STREETS,
+    hand_strength, draw_potential, raise_frac_to_amount,
+)
 from .ppo_agent import PPOAgent
 
 
@@ -105,47 +108,55 @@ class RLDecisionEngine:
         street_idx = STREETS.index(street) if street in STREETS else 0
         v[132 + street_idx] = 1.0
 
+        # [143] hand strength
+        v[143] = hand_strength(hole_cards, community_cards)
+
+        # [144] draw potential
+        v[144] = draw_potential(hole_cards, community_cards)
+
         return v
 
     def _legal_mask(self, available_actions: list, call_amount: float) -> np.ndarray:
         mask = np.zeros(NUM_ACTIONS, dtype=bool)
         action_map = {
-            "fold":  0,
-            "check": 1,
-            "call":  2,
-            "raise": [3, 4, 5],
-            "allin": 6,
+            "fold":  Action.FOLD,
+            "check": Action.CHECK,
+            "call":  Action.CALL,
+            "raise": Action.RAISE,
+            "allin": Action.ALL_IN,
         }
         for a in available_actions:
             idx = action_map.get(a)
-            if idx is None:
-                continue
-            if isinstance(idx, list):
-                for i in idx:
-                    mask[i] = True
-            else:
+            if idx is not None:
                 mask[idx] = True
 
-        if call_amount == 0 and not mask[1]:
-            mask[1] = True
+        if call_amount == 0 and not mask[Action.CHECK]:
+            mask[Action.CHECK] = True
         if call_amount > 0:
-            mask[0] = True
+            mask[Action.FOLD] = True
 
         return mask
 
     def _action_to_decision(
-        self, action_idx: int, call_amount: float, pot: float, hero_stack: float
+        self, action_idx: int, raise_frac: float,
+        call_amount: float, pot: float, hero_stack: float
     ) -> Decision:
-        action_map = {
-            Action.FOLD:     ("fold",  0.0),
-            Action.CHECK:    ("check", 0.0),
-            Action.CALL:     ("call",  call_amount),
-            Action.RAISE_25: ("raise", call_amount + pot * 0.25),
-            Action.RAISE_50: ("raise", call_amount + pot * 0.50),
-            Action.RAISE_100:("raise", call_amount + pot * 1.00),
-            Action.ALL_IN:   ("allin", hero_stack),
-        }
-        act_name, amount = action_map.get(action_idx, ("fold", 0.0))
+        if action_idx == Action.FOLD:
+            act_name, amount = "fold", 0.0
+        elif action_idx == Action.CHECK:
+            act_name, amount = "check", 0.0
+        elif action_idx == Action.CALL:
+            act_name, amount = "call", call_amount
+        elif action_idx == Action.RAISE:
+            min_raise = call_amount + pot * 0.33
+            max_raise = hero_stack
+            amount = raise_frac_to_amount(raise_frac, min_raise, max_raise)
+            act_name = "raise"
+        elif action_idx == Action.ALL_IN:
+            act_name, amount = "allin", hero_stack
+        else:
+            act_name, amount = "fold", 0.0
+
         amount = min(amount, hero_stack)
         return Decision(action=act_name, amount=round(amount, 2),
                         reasoning=f"RL policy (ELO={self.agent.elo:.0f})",
@@ -168,5 +179,5 @@ class RLDecisionEngine:
                                pot, hero_stack, call_amount,
                                position, num_opponents, opponent_profiles)
         mask = self._legal_mask(available_actions, call_amount)
-        action_idx, _, _, _ = self.agent.get_action(obs, mask, deterministic=False)
-        return self._action_to_decision(action_idx, call_amount, pot, hero_stack)
+        action_idx, raise_frac, _, _, _ = self.agent.get_action(obs, mask, deterministic=False)
+        return self._action_to_decision(action_idx, raise_frac, call_amount, pot, hero_stack)

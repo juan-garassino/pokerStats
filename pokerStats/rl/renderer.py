@@ -134,27 +134,42 @@ def render_table(state: dict) -> str:
 
 
 def render_training_stats(stats: dict) -> str:
-    """Compact one-liner for training loop output."""
-    ep   = stats.get("episode", 0)
-    step = stats.get("step", 0)
-    rew  = stats.get("mean_reward", 0)
-    wpct = stats.get("win_pct", 0)
-    bb   = stats.get("bb_per_100", 0)
-    elo  = stats.get("elo", 1500)
-    loss = stats.get("policy_loss", 0)
-    ent  = stats.get("entropy", 0)
+    """Two-line training log: key metrics + detail line."""
+    ep    = stats.get("episode", 0)
+    step  = stats.get("step", 0)
+    wpct  = stats.get("win_pct", 0)
+    bb    = stats.get("bb_per_100", 0)
+    elo   = stats.get("elo", 1500)
+    ploss = stats.get("policy_loss", 0)
+    vloss = stats.get("value_loss", 0)
+    ent   = stats.get("entropy", 0)
+    hps   = stats.get("hands_per_sec", 0)
+    pct   = stats.get("phase_pct", 0)
+    upd   = stats.get("ppo_updates", 0)
 
     bar_len = int(wpct * 20)
     filled = "\u2588" * bar_len
     empty  = "\u2591" * (20 - bar_len)
     bar = f"{GREEN}{filled}{GRAY}{empty}{RESET}"
 
-    return (
-        f"  ep={ep:>7,}  step={step:>9,}  "
-        f"win={bar} {wpct * 100:4.1f}%  "
-        f"bb/100={bb:+6.2f}  elo={elo:>5.0f}  "
-        f"loss={loss:.4f}  ent={ent:.3f}"
+    line1 = (
+        f"  hand {ep:>6,}  step {step:>8,}  "
+        f"win {bar} {wpct * 100:4.1f}%  "
+        f"bb/100 {bb:+7.2f}  elo {elo:>5.0f}"
     )
+    # Auxiliary losses (AlphaPoker)
+    aux_card  = stats.get("aux_card_loss", 0)
+    aux_range = stats.get("aux_range_loss", 0)
+    aux_str = ""
+    if aux_card > 0 or aux_range > 0:
+        aux_str = f"  aux_c={aux_card:.4f}  aux_r={aux_range:.4f}"
+
+    line2 = (
+        f"    {GRAY}ploss={ploss:+.4f}  vloss={vloss:.4f}  "
+        f"ent={ent:.3f}{aux_str}  updates={upd}  "
+        f"{hps:.1f} hands/s  [{pct:.0f}%]{RESET}"
+    )
+    return f"{line1}\n{line2}"
 
 
 if __name__ == "__main__":

@@ -4,14 +4,14 @@ No-Limit Texas Hold'em environment
 OpenAI Gym-compatible multi-agent poker environment.
 
 Design choices:
-  - Observation:  143-dim vector (hand + board + betting history + position)
-  - Action space: Discrete(7) — fold, check, call, raise_25%, raise_50%,
-                               raise_100% (pot), all_in
+  - Observation:  145-dim vector (hand + board + betting + position + hand strength)
+  - Action space: Discrete(10) — fold, check, call, raise 33/50/75/100/125/150/200%, all_in
   - Reward:       BB-normalized (chips won / big_blind)
   - Info asymmetry: each agent only sees its own hole cards
   - Supports 2-6 players
 """
 
+import copy
 import random
 import numpy as np
 from dataclasses import dataclass, field
@@ -41,35 +41,47 @@ from .renderer import render_table, render_hand
 
 
 # ── Action encoding ───────────────────────────────────────────────────────────
+# Hybrid discrete-continuous: 5 action types + continuous raise sizing
 class Action(IntEnum):
-    FOLD       = 0
-    CHECK      = 1   # only valid when no bet to call
-    CALL       = 2
-    RAISE_25   = 3   # 25% of pot
-    RAISE_50   = 4   # 50% of pot
-    RAISE_100  = 5   # 100% of pot (pot-sized bet)
-    ALL_IN     = 6
+    FOLD   = 0
+    CHECK  = 1   # only valid when no bet to call
+    CALL   = 2
+    RAISE  = 3   # continuous sizing via raise_frac in [0, 1]
+    ALL_IN = 4
 
 NUM_ACTIONS = len(Action)
 
-# Raise multipliers (fraction of pot)
-RAISE_FRACS = {
-    Action.RAISE_25:  0.25,
-    Action.RAISE_50:  0.50,
-    Action.RAISE_100: 1.00,
-}
+# raise_frac mapping: 0.0 = min raise, 1.0 = all-in
+# Exponential curve: smooth near 0 (fine control on small bets),
+# steep near 1 (coarse on overbets). Formula:
+#   actual = (e^(k * frac) - 1) / (e^k - 1),  k = 3.0
+# Landmarks (k=3):
+#   frac=0.0 → min raise     frac=0.3 → ~12% of range
+#   frac=0.5 → ~26%          frac=0.7 → ~51%
+#   frac=0.9 → ~82%          frac=1.0 → all-in
+import math
+RAISE_CURVE_K = 3.0
+_EXP_K = math.exp(RAISE_CURVE_K) - 1.0
+
+def raise_frac_to_amount(frac: float, min_raise: float, max_raise: float) -> float:
+    """Map [0,1] to [min_raise, max_raise] with exponential curve."""
+    frac = max(0.0, min(1.0, frac))
+    curved = (math.exp(RAISE_CURVE_K * frac) - 1.0) / _EXP_K
+    return min_raise + curved * (max_raise - min_raise)
 
 # ── Observation space layout ──────────────────────────────────────────────────
-# [0:52]   hole cards (one-hot, 52 bits)
-# [52:104] community cards (one-hot, 52 bits)
+# [0:52]    hole cards (one-hot, 52 bits)
+# [52:104]  community cards (one-hot, 52 bits)
 # [104:110] per-player stack normalized (6 players)
 # [110:116] per-player current bet normalized
 # [116:122] per-player active flags
 # [122:128] per-player position (dealer=0,SB=1,BB=2... normalized)
 # [128:132] pot, call_amount, min_raise, num_active (normalized)
 # [132:136] street one-hot [preflop, flop, turn, river]
-# [136:143] last 7 actions one-hot encoded
-OBS_DIM = 143
+# [136:143] last 7 actions normalized
+# [143]     hand strength (0=trash, 1=nuts)
+# [144]     draw potential (0=none, 1=strong draw)
+OBS_DIM = 145
 
 STREETS = ["preflop", "flop", "turn", "river"]
 
@@ -87,6 +99,72 @@ def cards_to_onehot(cards: list) -> np.ndarray:
         if c in CARD_IDX:
             v[CARD_IDX[c]] = 1.0
     return v
+
+
+def hand_strength(hole_cards: list, community: list) -> float:
+    """
+    Estimate hand strength 0-1 (1 = nuts).
+    Uses treys evaluator postflop, simple heuristic preflop.
+    This lets the agent explicitly know when it's bluffing.
+    """
+    if not hole_cards:
+        return 0.0
+
+    if not community:
+        # Preflop heuristic based on card ranks
+        r0 = RANKS.index(hole_cards[0][0])
+        r1 = RANKS.index(hole_cards[1][0])
+        suited = hole_cards[0][1] == hole_cards[1][1]
+        pair = r0 == r1
+        high = max(r0, r1) / 12.0
+        if pair:
+            return 0.5 + high * 0.5  # pairs: 0.5 (22) to 1.0 (AA)
+        gap = abs(r0 - r1)
+        connected = gap <= 1
+        score = high * 0.4 + (0.1 if suited else 0) + (0.1 if connected else 0) - gap * 0.02
+        return max(0.0, min(1.0, score))
+
+    if TREYS_OK:
+        try:
+            board = [Card.new(c[0] + c[1]) for c in community]
+            hand = [Card.new(c[0] + c[1]) for c in hole_cards]
+            rank = _evaluator.evaluate(board, hand)
+            # treys rank: 1 (royal flush) to 7462 (worst)
+            return 1.0 - (rank / 7462.0)
+        except Exception:
+            return 0.5
+
+    return 0.5
+
+
+def draw_potential(hole_cards: list, community: list) -> float:
+    """
+    Estimate drawing potential 0-1.
+    Detects flush draws (4 to a flush) and straight draws (open-ended).
+    """
+    if not community or not hole_cards:
+        return 0.0
+
+    all_cards = hole_cards + community
+    suits = [c[1] for c in all_cards]
+    ranks = sorted(set(RANKS.index(c[0]) for c in all_cards))
+
+    score = 0.0
+
+    # Flush draw: 4+ of same suit
+    max_suited = max(suits.count(s) for s in "cdhs")
+    if max_suited >= 4:
+        score += 0.5
+    if max_suited >= 5:
+        score += 0.3  # made flush, still has draw value for better flush
+
+    # Straight draw: 4 cards within a window of 5
+    for i in range(len(ranks) - 3):
+        if ranks[i + 3] - ranks[i] <= 4:
+            score += 0.5
+            break
+
+    return min(1.0, score)
 
 
 # ── Player state ──────────────────────────────────────────────────────────────
@@ -126,6 +204,28 @@ def compute_pots(players: list) -> list:
             pots.append((pot_amt, eligible))
         prev = level
     return pots
+
+
+class _LazyObs:
+    """Lazy observation dict — only builds obs vector on first access per player."""
+    __slots__ = ('_env', '_cache')
+
+    def __init__(self, env):
+        self._env = env
+        self._cache = {}
+
+    def __getitem__(self, idx):
+        if idx not in self._cache:
+            self._cache[idx] = self._env._build_obs(idx)
+        return self._cache[idx]
+
+    def __contains__(self, idx):
+        return 0 <= idx < self._env.num_players
+
+    def get(self, idx, default=None):
+        if idx in self:
+            return self[idx]
+        return default
 
 
 # ── Main environment ──────────────────────────────────────────────────────────
@@ -197,6 +297,8 @@ class PokerEnv:
         self._action_ids = []
         self._done      = False
         self._rewards   = {i: 0.0 for i in range(self.num_players)}
+        self._hs_cache  = {}  # (player_idx, street_idx) -> (hand_strength, draw_potential)
+        self._showdown_info = {}  # filled by _showdown()
 
         # Rebuild deck
         self.deck = ALL_CARDS[:]
@@ -251,9 +353,15 @@ class PokerEnv:
             p.all_in = True
 
     # ── Step ─────────────────────────────────────────────────────────────────
-    def step(self, action: int) -> tuple:
+    def step(self, action: int, raise_frac: float = 0.5) -> tuple:
         """
         Take one action for the current player.
+
+        Args:
+            action:     Action type (0-4: fold/check/call/raise/all-in)
+            raise_frac: Continuous raise sizing in [0, 1] when action == RAISE.
+                        0.0 = minimum raise, 1.0 = all-in.
+
         Returns (obs_dict, rewards_dict, done, info).
         """
         if self._done:
@@ -290,13 +398,13 @@ class PokerEnv:
                 p.all_in = True
             self._log(f"{self._pname(p)}: call ${amt:.1f}")
 
-        elif action in RAISE_FRACS:
-            frac     = RAISE_FRACS[action]
-            raise_to = call_amt + self.pot * frac
-            raise_to = max(raise_to, self.last_bet * 2)
-            raise_to = min(raise_to, p.stack + p.current_bet)
-            actual   = raise_to - p.current_bet
-            actual   = min(actual, p.stack)
+        elif action == Action.RAISE:
+            # Continuous sizing with exponential curve
+            min_raise  = max(self.last_bet * 2, call_amt + self.big_blind)
+            max_raise  = p.stack + p.current_bet
+            raise_to   = raise_frac_to_amount(raise_frac, min_raise, max_raise)
+            actual     = raise_to - p.current_bet
+            actual     = min(actual, p.stack)
             p.stack      -= actual
             p.current_bet += actual
             p.total_bet   += actual
@@ -305,7 +413,7 @@ class PokerEnv:
             self.raises_this_street += 1
             if p.stack == 0:
                 p.all_in = True
-            self._log(f"{self._pname(p)}: raise to ${raise_to:.1f}")
+            self._log(f"{self._pname(p)}: raise ${actual:.0f} to ${raise_to:.0f}")
 
         elif action == Action.ALL_IN:
             amt = p.stack
@@ -315,17 +423,32 @@ class PokerEnv:
             self.pot      += amt
             p.all_in      = True
             self.last_bet  = max(self.last_bet, p.current_bet)
-            self._log(f"{self._pname(p)}: all-in ${p.total_bet:.1f}")
+            self._log(f"{self._pname(p)}: all-in ${p.total_bet:.0f}")
 
         # Record action id for obs vector (fixes _action_ids bug)
         self._action_ids.append(int(action))
+
+        # Track action metadata for opponent modeling
+        action_player = self.current_player
+        action_taken = int(action)
+        action_raise_frac = raise_frac if action == Action.RAISE else 0.0
 
         # Advance to next player
         self._advance()
 
         obs  = self._get_obs()
         done = self._done
-        info = {"street": STREETS[self.street_idx], "pot": self.pot, "hand_num": self.hand_num}
+        info = {
+            "street": STREETS[self.street_idx],
+            "pot": self.pot,
+            "hand_num": self.hand_num,
+            "showdown": self._showdown_info.get("occurred", False) if done else False,
+            "showdown_players": self._showdown_info.get("players", []) if done else [],
+            "revealed_cards": self._showdown_info.get("cards", {}) if done else {},
+            "action_player": action_player,
+            "action_taken": action_taken,
+            "raise_frac": action_raise_frac,
+        }
 
         if self.render_mode == "unicode":
             print(self._render_unicode())
@@ -386,8 +509,12 @@ class PokerEnv:
 
         # First to act postflop: first active left of dealer
         nxt = (self.dealer_idx + 1) % self.num_players
+        start = nxt
         while self.players[nxt].folded or self.players[nxt].all_in:
             nxt = (nxt + 1) % self.num_players
+            if nxt == start:
+                # Everyone is all-in or folded — no one to act
+                break
         self.current_player = nxt
 
         if self.render_mode == "unicode":
@@ -399,6 +526,13 @@ class PokerEnv:
     def _showdown(self):
         active  = [p for p in self.players if not p.folded]
         pots    = compute_pots(self.players)
+
+        # Record showdown info for opponent modeling
+        self._showdown_info = {
+            "occurred": True,
+            "players": [p.idx for p in active],
+            "cards": {p.idx: list(p.hole_cards) for p in active},
+        }
 
         if self.render_mode == "unicode":
             print("\n  SHOWDOWN")
@@ -473,12 +607,11 @@ class PokerEnv:
         else:
             legal.append(Action.CALL)
 
-        # Raises: available if under raise cap and have chips
+        # Raise: available if under raise cap and have chips for min raise
         if self.raises_this_street < self.max_raises:
-            for act in [Action.RAISE_25, Action.RAISE_50, Action.RAISE_100]:
-                min_raise_amt = self.last_bet * 2
-                if p.stack + p.current_bet > min_raise_amt:
-                    legal.append(act)
+            min_raise_amt = self.last_bet * 2
+            if p.stack + p.current_bet > min_raise_amt:
+                legal.append(Action.RAISE)
 
         # All-in always available if have chips
         if p.stack > 0:
@@ -495,12 +628,9 @@ class PokerEnv:
         return mask
 
     # ── Observation ───────────────────────────────────────────────────────────
-    def _get_obs(self) -> dict:
-        """Returns an observation dict: {player_idx: obs_vector}."""
-        obs = {}
-        for i, p in enumerate(self.players):
-            obs[i] = self._build_obs(i)
-        return obs
+    def _get_obs(self) -> '_LazyObs':
+        """Returns a lazy observation dict: obs[i] builds on first access."""
+        return _LazyObs(self)
 
     def _build_obs(self, player_idx: int) -> np.ndarray:
         p = self.players[player_idx]
@@ -544,6 +674,15 @@ class PokerEnv:
         for j, a in enumerate(recent):
             v[136 + j] = a / NUM_ACTIONS
 
+        # [143-144] hand strength + draw potential (cached per player per street)
+        cache_key = (player_idx, self.street_idx)
+        if cache_key not in self._hs_cache:
+            self._hs_cache[cache_key] = (
+                hand_strength(p.hole_cards, self.community),
+                draw_potential(p.hole_cards, self.community),
+            )
+        v[143], v[144] = self._hs_cache[cache_key]
+
         return v
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -581,6 +720,36 @@ class PokerEnv:
             ],
             "last_actions": self._action_log,
         })
+
+    def clone(self) -> 'PokerEnv':
+        """Create a lightweight copy for MCTS simulation."""
+        c = PokerEnv.__new__(PokerEnv)
+        c.num_players    = self.num_players
+        c.starting_stack = self.starting_stack
+        c.small_blind    = self.small_blind
+        c.big_blind      = self.big_blind
+        c.render_mode    = "none"
+        c.max_raises     = self.max_raises
+        c.players        = [copy.copy(p) for p in self.players]
+        for p in c.players:
+            p.hole_cards = list(p.hole_cards)
+        c.community      = list(self.community)
+        c.deck           = list(self.deck)
+        c.pot            = self.pot
+        c.street_idx     = self.street_idx
+        c.current_player = self.current_player
+        c.dealer_idx     = self.dealer_idx
+        c.hand_num       = self.hand_num
+        c.episode        = self.episode
+        c.last_bet       = self.last_bet
+        c.raises_this_street = self.raises_this_street
+        c._action_log    = list(self._action_log)
+        c._action_ids    = list(self._action_ids)
+        c._done          = self._done
+        c._rewards       = dict(self._rewards)
+        c._hs_cache      = dict(self._hs_cache)
+        c._showdown_info = dict(self._showdown_info)
+        return c
 
     def render(self):
         print(self._render_unicode())

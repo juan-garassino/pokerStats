@@ -70,12 +70,15 @@ def test_render_table_output():
 
 
 def test_render_training_stats():
-    """render_training_stats produces a compact string."""
+    """render_training_stats produces a two-line string with key metrics."""
     stats = {
         "episode": 100, "step": 5000, "mean_reward": 0.5,
         "win_pct": 0.5, "bb_per_100": 2.0, "elo": 1500,
-        "policy_loss": 0.01, "entropy": 1.5,
+        "policy_loss": 0.01, "value_loss": 0.05, "entropy": 1.5,
+        "hands_per_sec": 12.3, "phase_pct": 45.0, "ppo_updates": 3,
     }
     result = render_training_stats(stats)
-    assert "ep=" in result
-    assert "elo=" in result
+    assert "hand" in result
+    assert "elo" in result
+    assert "ploss" in result
+    assert "hands/s" in result

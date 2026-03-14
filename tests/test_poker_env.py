@@ -1,12 +1,16 @@
 """Tests for pokerStats.rl.poker_env"""
 import numpy as np
-from pokerStats.rl.poker_env import PokerEnv, Action, NUM_ACTIONS, OBS_DIM
+from pokerStats.rl.poker_env import (
+    PokerEnv, Action, NUM_ACTIONS, OBS_DIM,
+    hand_strength, draw_potential, raise_frac_to_amount,
+)
 
 
 def test_obs_shape():
-    """Observation vectors have the correct dimension."""
+    """Observation vectors have the correct dimension (145)."""
     env = PokerEnv(num_players=6)
     obs = env.reset()
+    assert OBS_DIM == 145
     for i in range(6):
         assert obs[i].shape == (OBS_DIM,), f"Player {i} obs shape mismatch"
 
@@ -80,3 +84,75 @@ def test_multiple_hands():
             legal = env.legal_actions()
             obs, rewards, done, _ = env.step(legal[0])
     assert env.hand_num == 5
+
+
+def test_num_actions():
+    """Action space has 5 discrete actions + continuous raise sizing."""
+    assert NUM_ACTIONS == 5
+
+
+def test_hand_strength_preflop():
+    """Hand strength heuristic works preflop (no community)."""
+    # Pocket aces should be near 1.0
+    aa = hand_strength(["Ah", "As"], [])
+    assert aa > 0.9
+
+    # 2-7 offsuit should be low
+    low = hand_strength(["2c", "7d"], [])
+    assert low < 0.3
+
+    assert aa > low
+
+
+def test_hand_strength_postflop():
+    """Hand strength uses treys postflop when available."""
+    hs = hand_strength(["Ah", "Kh"], ["Qh", "Jh", "Th"])
+    # Royal flush — should be very high
+    assert hs > 0.95
+
+
+def test_draw_potential():
+    """Flush and straight draws detected."""
+    # 4 hearts = flush draw
+    dp = draw_potential(["Ah", "2h"], ["5h", "8h", "Tc"])
+    assert dp >= 0.5
+
+    # No draw
+    dp_none = draw_potential(["Ac", "Kd"], ["2h", "7s", "Js"])
+    assert dp_none < 0.5
+
+
+def test_obs_has_hand_strength():
+    """Obs vector slots 143-144 contain hand strength and draw potential."""
+    env = PokerEnv(num_players=3)
+    obs = env.reset()
+    for i in range(3):
+        # Hand strength should be between 0 and 1
+        assert 0.0 <= obs[i][143] <= 1.0
+        assert 0.0 <= obs[i][144] <= 1.0
+
+
+def test_raise_curve_boundaries():
+    """Exponential raise curve maps 0->min and 1->max."""
+    result_0 = raise_frac_to_amount(0.0, 10.0, 200.0)
+    result_1 = raise_frac_to_amount(1.0, 10.0, 200.0)
+    assert abs(result_0 - 10.0) < 0.01, f"frac=0 should give min_raise, got {result_0}"
+    assert abs(result_1 - 200.0) < 0.01, f"frac=1 should give max_raise, got {result_1}"
+
+
+def test_raise_curve_is_exponential():
+    """Small fracs give proportionally smaller raises (exponential shape)."""
+    # At frac=0.5, result should be less than midpoint (exponential curve)
+    mid = raise_frac_to_amount(0.5, 0.0, 100.0)
+    assert mid < 50.0, f"Exponential curve should give <50 at frac=0.5, got {mid}"
+
+
+def test_continuous_raise_in_step():
+    """step() accepts raise_frac and produces valid raise amounts."""
+    env = PokerEnv(num_players=3)
+    env.reset()
+    # Find a state where raise is legal
+    legal = env.legal_actions()
+    if Action.RAISE in legal:
+        obs, rewards, done, info = env.step(Action.RAISE, 0.3)
+        assert isinstance(rewards, dict)

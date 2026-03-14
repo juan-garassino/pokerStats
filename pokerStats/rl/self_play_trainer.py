@@ -1,20 +1,25 @@
 """
-Self-play + league training
-────────────────────────────
+Multi-agent self-play + league training
+─────────────────────────────────────────
 Training curriculum:
-  Phase 1 — Pure self-play (agent vs copies of itself)
-  Phase 2 — League play (agent vs pool of frozen past checkpoints)
+  Phase 1 — Pure self-play (all 6 seats learn with shared weights)
+  Phase 2 — League play (frozen checkpoints for diversity)
   Phase 3 — Fine-tune vs human-mimic opponents (scripted archetypes)
+
+All seats share one AlphaPokerNet. Diversity comes from different
+opponent history buffers. One checkpoint to download and deploy.
 """
 
 import copy
+import time
 import random
 import numpy as np
 from pathlib import Path
 from collections import deque
 
-from .poker_env import PokerEnv, NUM_ACTIONS
-from .ppo_agent import PPOAgent, RolloutBuffer
+from .poker_env import PokerEnv, Action, NUM_ACTIONS
+from .ppo_agent import PPOAgent, RolloutBuffer, AlphaPokerNet
+from .opponent_encoder import InHandRecorder, EVENT_DIM, MAX_SEQ_LEN, LATENT_DIM
 from .renderer import render_training_stats
 
 
@@ -46,6 +51,7 @@ CFG = {
     "eval_freq":              1000,
     "eval_hands":             500,
     "min_elo_gain":           10.0,
+    "log_freq":               25,       # print stats every N hands
 
     # Training phases
     "phase1_hands":     50_000,
@@ -75,50 +81,60 @@ class ScriptedAgent:
         self.style = style
 
     def get_action(self, obs: np.ndarray, legal_mask: np.ndarray,
-                   deterministic: bool = False) -> tuple:
+                   deterministic: bool = False, **kwargs) -> tuple:
+        """Returns (action, raise_frac, log_prob, value, entropy)."""
         legal = [i for i in range(NUM_ACTIONS) if legal_mask[i]]
         if not legal:
-            return 0, 0.0, 0.0, 0.0
+            return 0, 0.0, 0.0, 0.0, 0.0
 
-        # Decode obs scalars
         call_norm   = float(obs[129])
         street_oh   = obs[132:136]
         street_idx  = int(np.argmax(street_oh)) if any(street_oh) else 0
         call_high   = call_norm > 0.05
 
+        raise_frac = 0.3
+
         if self.style == "nit":
-            if call_high and 5 not in legal:
-                action = 0
-            elif not call_high:
-                action = 1
+            if call_high:
+                action = Action.FOLD
             else:
-                action = 2
+                action = Action.CHECK
 
         elif self.style == "fish":
-            action = 2 if 2 in legal else (1 if 1 in legal else 0)
+            action = Action.CALL if Action.CALL in legal else (
+                Action.CHECK if Action.CHECK in legal else Action.FOLD)
 
         elif self.style == "maniac":
-            if 6 in legal and random.random() < 0.3:
-                action = 6
-            elif 5 in legal and random.random() < 0.4:
-                action = 5
-            elif 4 in legal:
-                action = 4
+            if Action.ALL_IN in legal and random.random() < 0.3:
+                action = Action.ALL_IN
+            elif Action.RAISE in legal:
+                action = Action.RAISE
+                raise_frac = random.uniform(0.5, 1.0)
             else:
                 action = random.choice(legal)
 
         elif self.style == "tight-aggressive":
             if street_idx == 0:
                 if call_high:
-                    action = 4 if 4 in legal and random.random() < 0.5 else 2
+                    if Action.RAISE in legal and random.random() < 0.5:
+                        action = Action.RAISE
+                        raise_frac = 0.25
+                    else:
+                        action = Action.CALL
                 else:
-                    action = 3 if 3 in legal else 1
+                    if Action.RAISE in legal:
+                        action = Action.RAISE
+                        raise_frac = 0.20
+                    else:
+                        action = Action.CHECK
             else:
                 action = random.choice(legal)
+                if action == Action.RAISE:
+                    raise_frac = random.uniform(0.15, 0.40)
         else:
             action = random.choice(legal)
 
-        return int(action), 0.0, 0.0, 0.0
+        return int(action), raise_frac, 0.0, 0.0, 0.0
 
 
 # ── League manager ────────────────────────────────────────────────────────────
@@ -162,111 +178,221 @@ class League:
         return len(self.members)
 
 
-# ── Trainer ───────────────────────────────────────────────────────────────────
-class SelfPlayTrainer:
+# ── Multi-Agent Trainer ─────────────────────────────────────────────────────
+class MultiAgentTrainer:
+    """
+    All 6 seats learn with shared weights via one AlphaPokerNet.
+    Each seat maintains its own rollout buffer and opponent history.
+    """
     def __init__(self, cfg: dict = CFG):
-        self.cfg     = cfg
-        self.env     = PokerEnv(
+        self.cfg = cfg
+        self.env = PokerEnv(
             num_players    = cfg["num_players"],
             starting_stack = cfg["starting_stack"],
             big_blind      = cfg["big_blind"],
             render_mode    = "none",
         )
-        self.agent   = PPOAgent(lr=cfg["lr"], clip_eps=cfg["clip_eps"],
-                                entropy_coef=cfg["entropy_coef"],
-                                value_coef=cfg["value_coef"])
-        self.buffer  = RolloutBuffer(cfg["rollout_steps"])
-        self.league  = League(max_size=cfg["league_size"])
-        self.save_dir= Path(cfg["save_dir"])
+        self.num_players = cfg["num_players"]
+
+        # One shared agent (AlphaPokerNet)
+        self.agent = PPOAgent(
+            lr=cfg["lr"], clip_eps=cfg["clip_eps"],
+            entropy_coef=cfg["entropy_coef"],
+            value_coef=cfg["value_coef"],
+            use_alpha=True,
+            num_opponents=self.num_players - 1,
+        )
+
+        # Per-seat rollout buffers
+        self.buffers = [
+            RolloutBuffer(cfg["rollout_steps"],
+                          num_opponents=self.num_players - 1)
+            for _ in range(self.num_players)
+        ]
+
+        # Opponent history: histories[observer][opponent_slot] = deque of event vectors
+        self.histories = [
+            [deque(maxlen=MAX_SEQ_LEN) for _ in range(self.num_players)]
+            for _ in range(self.num_players)
+        ]
+
+        # In-hand action tracker
+        self.recorder = InHandRecorder(num_players=self.num_players)
+
+        # League
+        self.league   = League(max_size=cfg["league_size"])
+        self.save_dir = Path(cfg["save_dir"])
         self.save_dir.mkdir(parents=True, exist_ok=True)
 
-        self.hand_num   = 0
-        self.total_steps= 0
-        self.reward_hist= deque(maxlen=1000)
-        self.win_hist   = deque(maxlen=1000)
-        self.best_elo   = 1500.0
+        # Tracking
+        self.hand_num     = 0
+        self.total_steps  = 0
+        self.reward_hist  = [deque(maxlen=1000) for _ in range(self.num_players)]
+        self.win_hist     = deque(maxlen=1000)
+        self.best_elo     = 1500.0
+        self.last_metrics = {}
+        self.ppo_updates  = 0
+        self.t_start      = None
+
+        # Scripted agents for phase 3
+        self._scripted_seats = {}  # seat_idx -> ScriptedAgent (or None)
 
         # Add initial random opponent to league
-        rng_agent = PPOAgent()
+        rng_agent = PPOAgent(use_alpha=True,
+                             num_opponents=self.num_players - 1)
         rng_agent.elo = 1200.0
         self.league.add(rng_agent, tag="random_init")
 
-    # ── Opponent pool ──────────────────────────────────────────────────────────
-    def _get_opponents(self, phase: int) -> list:
-        n_opp = self.cfg["num_players"] - 1
+    def _get_opp_context(self, observer_idx: int) -> tuple:
+        """
+        Build opponent history tensors for one agent.
+        Returns (opp_events, opp_masks) as numpy arrays.
+        opp_events: (num_opponents, MAX_SEQ_LEN, EVENT_DIM)
+        opp_masks:  (num_opponents, MAX_SEQ_LEN) — True where padded
+        """
+        num_opp = self.num_players - 1
+        opp_events = np.zeros((num_opp, MAX_SEQ_LEN, EVENT_DIM), dtype=np.float32)
+        opp_masks  = np.ones((num_opp, MAX_SEQ_LEN), dtype=bool)  # True = padded
 
-        if phase == 1:
-            return [self.agent] * n_opp
+        opp_slot = 0
+        for pidx in range(self.num_players):
+            if pidx == observer_idx:
+                continue
+            history = self.histories[observer_idx][pidx]
+            n = len(history)
+            for j in range(min(n, MAX_SEQ_LEN)):
+                opp_events[opp_slot, j] = history[-(j + 1)]  # reversed chronological
+                opp_masks[opp_slot, j] = False  # not padded
+            opp_slot += 1
 
-        elif phase == 2:
-            opponents = []
-            for _ in range(n_opp):
-                league_opp = self.league.sample_weighted()
-                if league_opp and random.random() < 0.5:
-                    opponents.append(league_opp)
-                else:
-                    opponents.append(self.agent)
-            return opponents
+        return opp_events, opp_masks
 
-        else:  # phase 3
+    def _record_hand_events(self):
+        """After hand ends, build events for all observer-player pairs."""
+        for obs_idx in range(self.num_players):
+            for player_idx in range(self.num_players):
+                if obs_idx == player_idx:
+                    continue
+                event = self.recorder.build_event(obs_idx, player_idx, self.env)
+                self.histories[obs_idx][player_idx].append(event)
+
+    def _fill_showdown_targets(self, hand_start_ptrs: list):
+        """Fill auxiliary showdown targets in all buffers."""
+        info = self.env._showdown_info
+        if not info.get("occurred", False):
+            return
+
+        revealed = info.get("cards", {})
+        if not revealed:
+            return
+
+        from .poker_env import cards_to_onehot
+
+        for seat_idx in range(self.num_players):
+            start = hand_start_ptrs[seat_idx]
+            end = self.buffers[seat_idx].ptr
+            if start >= end:
+                continue
+
+            opp_slot = 0
+            for pidx in range(self.num_players):
+                if pidx == seat_idx:
+                    continue
+                if pidx in revealed:
+                    card_vec = cards_to_onehot(revealed[pidx])
+                    for t in range(start, end):
+                        idx = t % self.buffers[seat_idx].capacity
+                        self.buffers[seat_idx].showdown_cards[idx, opp_slot] = card_vec
+                        self.buffers[seat_idx].has_showdown[idx] = True
+                opp_slot += 1
+
+    def _setup_phase(self, phase: int):
+        """Configure scripted agents for the given phase."""
+        self._scripted_seats = {}
+        if phase == 3:
             styles = ["nit", "fish", "maniac", "tight-aggressive"]
-            opponents = []
-            for i in range(n_opp):
-                r = random.random()
-                if r < 0.3 and self.league.members:
-                    opponents.append(self.league.sample_weighted())
-                elif r < 0.6:
-                    opponents.append(ScriptedAgent(random.choice(styles)))
-                else:
-                    opponents.append(self.agent)
-            return opponents
+            # Assign scripted agents to half the non-hero seats
+            n_scripted = min(3, self.num_players - 1)
+            seats = random.sample(range(self.num_players), n_scripted)
+            for s in seats:
+                self._scripted_seats[s] = ScriptedAgent(random.choice(styles))
 
-    # ── Run one hand ──────────────────────────────────────────────────────────
     def _run_hand(self, phase: int) -> dict:
-        obs      = self.env.reset()
-        opponents= self._get_opponents(phase)
-        done     = False
-        metrics  = {}
+        obs = self.env.reset()
+        self.recorder.reset()
+        done = False
+        metrics = {}
+        max_steps = 200  # safety limit
 
-        while not done:
-            pidx  = self.env.current_player
-            o     = obs[pidx]
-            mask  = self.env.legal_mask()
+        # Record buffer positions at hand start for showdown targets
+        hand_start_ptrs = [buf.ptr for buf in self.buffers]
 
-            if pidx == 0:  # hero (learning agent)
-                action, log_prob, value, entropy = self.agent.get_action(o, mask)
-                obs_next, rewards, done, info = self.env.step(action)
+        step_count = 0
+        while not done and step_count < max_steps:
+            step_count += 1
+            pidx = self.env.current_player
+            o = obs[pidx]
+            mask = self.env.legal_mask()
 
-                reward = rewards.get(0, 0.0)
-                self.buffer.add(o, action, log_prob, reward, value,
-                                float(done), mask)
+            # Check if this seat uses a scripted agent (phase 3)
+            scripted = self._scripted_seats.get(pidx)
+
+            if scripted is not None:
+                action, raise_frac, _, _, _ = scripted.get_action(o, mask)
+                obs_next, rewards, done, info = self.env.step(action, raise_frac)
+                self.recorder.record(pidx, action, raise_frac,
+                                     self.env.pot, self.env.street_idx)
+            else:
+                # All learning seats use the shared agent
+                opp_events, opp_masks = self._get_opp_context(pidx)
+                action, raise_frac, log_prob, value, entropy = \
+                    self.agent.get_action(o, mask,
+                                          opp_events=opp_events,
+                                          opp_masks=opp_masks)
+
+                obs_next, rewards, done, info = self.env.step(action, raise_frac)
+
+                # Record action for all observers
+                self.recorder.record(pidx, action, raise_frac,
+                                     self.env.pot, self.env.street_idx)
+
+                # Store in this player's buffer
+                reward = rewards.get(pidx, 0.0)
+                self.buffers[pidx].add(
+                    o, action, raise_frac, log_prob, reward, value,
+                    float(done), mask, opp_events, opp_masks
+                )
                 self.total_steps += 1
 
-                if self.buffer.full:
+                # PPO update when buffer is full
+                if self.buffers[pidx].full:
                     metrics = self.agent.update(
-                        self.buffer,
+                        self.buffers[pidx],
                         ppo_epochs=self.cfg["ppo_epochs"],
                         batch_size=self.cfg["batch_size"],
+                        hand_num=self.hand_num,
                     )
-            else:
-                opp_idx = pidx - 1
-                opp     = opponents[min(opp_idx, len(opponents)-1)]
-                action, _, _, _ = opp.get_action(o, mask)
-                obs_next, rewards, done, info = self.env.step(action)
+                    self.last_metrics = metrics
+                    self.ppo_updates += 1
 
             obs = obs_next
 
+        # Hand ended — record events and fill targets
+        self._record_hand_events()
+        self._fill_showdown_targets(hand_start_ptrs)
+
+        # Track per-seat rewards
+        for i in range(self.num_players):
+            r = self.env._rewards.get(i, 0.0)
+            self.reward_hist[i].append(r)
+
         hero_reward = self.env._rewards.get(0, 0.0)
-        self.reward_hist.append(hero_reward)
         self.win_hist.append(1.0 if hero_reward > 0 else 0.0)
         self.hand_num += 1
 
-        return {
-            "reward":  hero_reward,
-            "metrics": metrics,
-        }
+        return {"reward": hero_reward, "metrics": metrics}
 
-    # ── ELO evaluation ────────────────────────────────────────────────────────
+    # ── ELO evaluation ────────────────────────────────────────────────────
     def _eval_elo(self, n_hands: int = 500) -> float:
         if not self.league.members:
             return self.agent.elo
@@ -287,11 +413,12 @@ class SelfPlayTrainer:
                 o    = obs[pidx]
                 mask = eval_env.legal_mask()
                 if pidx == 0:
-                    action, _, _, _ = self.agent.get_action(o, mask, deterministic=True)
+                    action, rf, _, _, _ = self.agent.get_action(
+                        o, mask, deterministic=True)
                 else:
-                    opp    = self.league.sample()
-                    action, _, _, _ = opp.get_action(o, mask, deterministic=True)
-                obs, rewards, done, _ = eval_env.step(action)
+                    opp = self.league.sample()
+                    action, rf, _, _, _ = opp.get_action(o, mask, deterministic=True)
+                obs, rewards, done, _ = eval_env.step(action, rf)
 
             if rewards.get(0, 0.0) > 0:
                 wins += 1
@@ -306,48 +433,69 @@ class SelfPlayTrainer:
         self.agent.elo = hero_elo
         return hero_elo
 
-    # ── Main training loop ────────────────────────────────────────────────────
+    # ── Main training loop ────────────────────────────────────────────────
     def train(self):
         dline = "\u2550" * 70
         print(f"\n{dline}")
-        print(f"  PokerStars RL Training \u2014 Self-Play + League")
+        print(f"  AlphaPoker Multi-Agent Training")
         print(f"  Device: {self.agent.device}")
         total = self.cfg['phase1_hands'] + self.cfg['phase2_hands'] + self.cfg['phase3_hands']
         print(f"  Total hands: {total:,}")
+        print(f"  Seats: {self.num_players} (all learning, shared weights)")
         print(f"{dline}\n")
 
         phase_schedule = [
-            (1, self.cfg["phase1_hands"],  "Pure self-play"),
+            (1, self.cfg["phase1_hands"],  "Pure self-play (all seats learn)"),
             (2, self.cfg["phase2_hands"],  "League play"),
-            (3, self.cfg["phase3_hands"],  "Human archetype fine-tune"),
+            (3, self.cfg["phase3_hands"],  "Archetype fine-tune"),
         ]
 
         for phase, n_hands, phase_name in phase_schedule:
             sline = "\u2500" * 70
             print(f"\n{sline}")
             print(f"  Phase {phase}: {phase_name}  ({n_hands:,} hands)")
-            print(sline)
+            print(f"{sline}", flush=True)
+
+            self._setup_phase(phase)
+            self.t_start = time.time()
+            phase_start_hand = self.hand_num
 
             for h in range(n_hands):
                 result = self._run_hand(phase)
 
-                if self.hand_num % 100 == 0:
+                log_freq = self.cfg.get("log_freq", 25)
+                if self.hand_num % log_freq == 0:
+                    elapsed = time.time() - self.t_start
+                    hands_done = self.hand_num - phase_start_hand
+                    hps = hands_done / elapsed if elapsed > 0 else 0
+                    pct = hands_done / n_hands * 100
+
+                    # Average reward across all seats
+                    avg_rewards = [
+                        np.mean(rh) if rh else 0.0
+                        for rh in self.reward_hist
+                    ]
+                    mean_reward = np.mean(avg_rewards)
+
                     stats = {
                         "episode":     self.hand_num,
                         "step":        self.total_steps,
-                        "mean_reward": np.mean(self.reward_hist) if self.reward_hist else 0,
-                        "win_pct":     np.mean(self.win_hist)    if self.win_hist   else 0,
-                        "bb_per_100":  np.mean(self.reward_hist)*100 if self.reward_hist else 0,
+                        "mean_reward": mean_reward,
+                        "win_pct":     np.mean(self.win_hist) if self.win_hist else 0,
+                        "bb_per_100":  mean_reward * 100,
                         "elo":         self.agent.elo,
-                        **result.get("metrics", {}),
+                        "hands_per_sec": hps,
+                        "phase_pct":   pct,
+                        "ppo_updates": self.ppo_updates,
+                        **self.last_metrics,
                     }
-                    print(render_training_stats(stats))
+                    print(render_training_stats(stats), flush=True)
 
                 if self.hand_num % self.cfg["eval_freq"] == 0:
                     old_elo = self.agent.elo
                     new_elo = self._eval_elo(self.cfg["eval_hands"])
                     gain    = new_elo - old_elo
-                    print(f"\n  ELO eval: {old_elo:.0f} \u2192 {new_elo:.0f}  ({gain:+.1f})")
+                    print(f"\n  ELO eval: {old_elo:.0f} \u2192 {new_elo:.0f}  ({gain:+.1f})", flush=True)
 
                     if phase >= 2 and gain >= self.cfg["min_elo_gain"]:
                         self.league.add(
@@ -376,6 +524,10 @@ class SelfPlayTrainer:
         self.agent.save(str(self.save_dir / "final.pt"))
 
 
+# ── Backward-compatible alias ────────────────────────────────────────────────
+SelfPlayTrainer = MultiAgentTrainer
+
+
 def main():
     """Entry point for `python -m pokerStats.rl.self_play_trainer`."""
     import argparse
@@ -385,7 +537,7 @@ def main():
     parser.add_argument("--render", action="store_true", help="Show Unicode table every hand")
     args = parser.parse_args()
 
-    trainer = SelfPlayTrainer(CFG)
+    trainer = MultiAgentTrainer(CFG)
 
     if args.resume:
         trainer.agent.load(args.resume)
