@@ -168,16 +168,22 @@ class PokerMCTS:
         obs_t = torch.from_numpy(obs).unsqueeze(0)
         mask_t = torch.from_numpy(legal_mask.astype(np.bool_)).unsqueeze(0)
 
-        if opp_events is not None:
+        # Handle both AlphaPokerNet (7 returns) and legacy PokerNet (4 returns)
+        is_alpha = hasattr(self.net, 'opponent_encoder')
+
+        if is_alpha and opp_events is not None:
             opp_ev_t = torch.from_numpy(opp_events).unsqueeze(0)
             opp_mk_t = torch.from_numpy(opp_masks).unsqueeze(0)
             logits, _, _, value, _, _, range_pred = self.net(
                 obs_t, mask_t, opp_ev_t, opp_mk_t
             )
             range_np = range_pred[0].numpy()
-        else:
+        elif is_alpha:
             logits, _, _, value, _, _, range_pred = self.net(obs_t, mask_t)
             range_np = range_pred[0].numpy()
+        else:
+            logits, _, _, value = self.net(obs_t, mask_t)
+            range_np = np.ones(52) / 52  # uniform range for legacy net
 
         # Convert logits to probabilities
         logits_np = logits[0].numpy()

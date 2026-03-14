@@ -97,6 +97,65 @@ demo-trained-search:
 demo-6max:
 	python scripts/demo_play.py --hands 5 --players 6 --delay 0.3
 
+# ----------------------------------
+#          CFR TRAINING
+# ----------------------------------
+
+CFR_DIR ?= checkpoints/cfr
+CFR_BUCKETS ?= 50
+CFR_SAMPLES ?= 1000
+CFR_ITERS ?= 5000
+CFR_MIN_VISITS ?= 1
+
+# Full CFR pipeline: abstraction → solve → blueprint
+cfr-train: cfr-abstraction cfr-solve cfr-blueprint
+
+cfr-abstraction:
+	@mkdir -p $(CFR_DIR)
+	python scripts/train_cfr.py --phase abstraction \
+		--output-dir $(CFR_DIR) \
+		--n-buckets $(CFR_BUCKETS) \
+		--n-samples $(CFR_SAMPLES)
+
+cfr-solve:
+	python scripts/train_cfr.py --phase solve \
+		--output-dir $(CFR_DIR) \
+		--iterations $(CFR_ITERS)
+
+cfr-blueprint:
+	python scripts/train_cfr.py --phase blueprint \
+		--output-dir $(CFR_DIR) \
+		--min-visits $(CFR_MIN_VISITS)
+
+# Resume CFR training from checkpoint
+cfr-resume:
+	python scripts/train_cfr.py --phase solve \
+		--output-dir $(CFR_DIR) \
+		--iterations $(CFR_ITERS) \
+		--resume $(CFR_DIR)/solver_final.npz
+
+# Presets
+cfr-colab-quick:
+	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=1000
+
+cfr-colab:
+	$(MAKE) cfr-train CFR_BUCKETS=50 CFR_SAMPLES=1000 CFR_ITERS=5000
+
+cfr-colab-full:
+	$(MAKE) cfr-train CFR_BUCKETS=200 CFR_SAMPLES=10000 CFR_ITERS=100000
+
+# Test Kuhn poker convergence (instant sanity check)
+cfr-test-kuhn:
+	python -c "from pokerStats.cfr.cfr_solver import KuhnCFRSolver; \
+		s = KuhnCFRSolver(); s.train(10000); \
+		print('Kuhn Nash strategies:'); \
+		[print(f'  {k:10s}  pass={v.average_strategy()[0]:.3f}  bet={v.average_strategy()[1]:.3f}') \
+		 for k,v in sorted(s.info_sets.items())]"
+
+# Run CFR tests only
+cfr-test:
+	python -m pytest tests/test_abstraction.py tests/test_cfr_solver.py tests/test_hybrid_agent.py -v --tb=short
+
 count_lines:
 	@find ./ -name '*.py' -exec  wc -l {} \; | sort -n| awk \
         '{printf "%4s %s\n", $$1, $$2}{s+=$$0}END{print s}'

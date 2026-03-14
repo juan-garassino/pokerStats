@@ -256,6 +256,37 @@ class AlphaPokerNet(nn.Module):
 
         return logits, raise_alpha, raise_beta, value, latents, card_preds, range_pred
 
+    def forward_with_trunk(self, obs, legal_mask=None, opp_events=None, opp_masks=None):
+        """Forward pass that also returns trunk output for action prediction."""
+        batch_size = obs.shape[0]
+
+        if opp_events is not None and opp_masks is not None:
+            latents = self._encode_opponents(opp_events, opp_masks)
+            opp_latent = torch.cat(latents, dim=-1)
+        else:
+            latents = [torch.zeros(batch_size, self.latent_dim,
+                                   device=obs.device) for _ in range(self.num_opponents)]
+            opp_latent = torch.zeros(batch_size, self.num_opponents * self.latent_dim,
+                                     device=obs.device)
+
+        x = self._trunk(obs, opp_latent)
+
+        logits = self.actor(x)
+        value = self.critic(x).squeeze(-1)
+
+        raise_params = F.softplus(self.raise_head(x)) + 1.0
+        raise_alpha = raise_params[..., 0]
+        raise_beta = raise_params[..., 1]
+
+        if legal_mask is not None:
+            logits = logits.masked_fill(~legal_mask, float("-inf"))
+
+        card_preds = [torch.sigmoid(self.card_predictor(l)) for l in latents]
+        game_ctx = F.relu(self.game_ctx_proj(x))
+        range_pred = torch.sigmoid(self.range_head_proj(x))
+
+        return logits, raise_alpha, raise_beta, value, latents, card_preds, range_pred, x
+
     def act(self, obs: torch.Tensor, legal_mask: Optional[torch.Tensor] = None,
             opp_events: Optional[torch.Tensor] = None,
             opp_masks: Optional[torch.Tensor] = None,
@@ -354,6 +385,7 @@ class RolloutBuffer:
             advantages[t] = last_gae
 
         returns = advantages + self.values
+        advantages = np.clip(advantages, -10.0, 10.0)
         return returns, advantages
 
     def get_batches(self, batch_size: int, gamma: float = 0.99, gae_lambda: float = 0.95):
@@ -375,6 +407,9 @@ class RolloutBuffer:
                 torch.BoolTensor(self.opp_masks[b]),
                 torch.FloatTensor(self.showdown_cards[b]),
                 torch.BoolTensor(self.has_showdown[b]),
+                torch.FloatTensor(self.values[b]),
+                torch.LongTensor(self.next_actions[b]),
+                torch.BoolTensor(self.has_next_action[b]),
             )
 
     def reset(self):
@@ -437,6 +472,11 @@ class PPOAgent:
         # ELO rating (for league tracking)
         self.elo = 1500.0
 
+        # Running return normalization
+        self._ret_mean = 0.0
+        self._ret_var = 1.0
+        self._ret_count = 0
+
     def _sync_cpu_net(self):
         """Copy GPU weights to CPU inference net."""
         if self._cpu_dirty:
@@ -449,7 +489,8 @@ class PPOAgent:
     def get_action(self, obs: np.ndarray, legal_mask: np.ndarray,
                    deterministic: bool = False,
                    opp_events: Optional[np.ndarray] = None,
-                   opp_masks: Optional[np.ndarray] = None) -> tuple:
+                   opp_masks: Optional[np.ndarray] = None,
+                   temperature: float = 1.0) -> tuple:
         """
         Returns (action, raise_frac, log_prob, value, entropy).
         Accepts optional opponent context for AlphaPokerNet.
@@ -473,6 +514,7 @@ class PPOAgent:
 
         # Sample action using numpy (avoids torch Categorical overhead)
         logits_np = logits[0].numpy()
+        logits_np = logits_np / max(temperature, 0.01)
         logits_np = logits_np - logits_np.max()
         probs = np.exp(logits_np)
         probs = probs / probs.sum()
@@ -509,11 +551,20 @@ class PPOAgent:
         """Ramp auxiliary loss coefficient from 0 to 1 over warmup_hands."""
         return min(1.0, hand_num / max(warmup_hands, 1))
 
+    def _update_ret_stats(self, returns: np.ndarray):
+        """Welford's online algorithm for running mean/var."""
+        for r in returns:
+            self._ret_count += 1
+            delta = r - self._ret_mean
+            self._ret_mean += delta / self._ret_count
+            delta2 = r - self._ret_mean
+            self._ret_var += (delta * delta2 - self._ret_var) / self._ret_count
+
     def update(self, buffer: RolloutBuffer, ppo_epochs: int = 4,
                batch_size: int = 256, hand_num: int = 0) -> dict:
         """Run PPO update with optional auxiliary losses. Returns metrics."""
         total_loss = total_policy = total_value = total_entropy = 0.0
-        total_aux_card = total_aux_range = 0.0
+        total_aux_card = total_aux_range = total_aux_action = 0.0
         n_updates = 0
 
         warmup = self._aux_warmup(hand_num) if self.use_alpha else 0.0
@@ -522,16 +573,19 @@ class PPOAgent:
             for batch in buffer.get_batches(batch_size):
                 if self.use_alpha:
                     obs, actions, raise_fracs, old_log_probs, returns, \
-                        advantages, masks, opp_ev, opp_mk, sd_cards, has_sd = batch
+                        advantages, masks, opp_ev, opp_mk, sd_cards, has_sd, \
+                        old_values, next_actions, has_next_act = batch
                     obs, actions, raise_fracs, old_log_probs, returns, \
-                        advantages, masks, opp_ev, opp_mk, sd_cards, has_sd = (
+                        advantages, masks, opp_ev, opp_mk, sd_cards, has_sd, \
+                        old_values, next_actions, has_next_act = (
                         t.to(self.device) for t in
                         (obs, actions, raise_fracs, old_log_probs, returns,
-                         advantages, masks, opp_ev, opp_mk, sd_cards, has_sd)
+                         advantages, masks, opp_ev, opp_mk, sd_cards, has_sd,
+                         old_values, next_actions, has_next_act)
                     )
 
                     logits, raise_alpha, raise_beta, values, latents, \
-                        card_preds, range_pred = self.net(obs, masks, opp_ev, opp_mk)
+                        card_preds, range_pred, x = self.net.forward_with_trunk(obs, masks, opp_ev, opp_mk)
                 else:
                     obs, actions, raise_fracs, old_log_probs, returns, \
                         advantages, masks, *_ = batch
@@ -561,9 +615,18 @@ class PPOAgent:
                 surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss (normalize returns to prevent explosion)
-                returns_norm = (returns - returns.mean()) / (returns.std() + 1e-8)
-                value_loss = F.mse_loss(values, returns_norm)
+                # Value loss with running normalization + clipping
+                self._update_ret_stats(returns.cpu().numpy())
+                ret_std = max(self._ret_var ** 0.5, 1e-4)
+                returns_norm = (returns - self._ret_mean) / ret_std
+
+                if self.use_alpha:
+                    values_clipped = old_values + (values - old_values).clamp(-self.clip_eps, self.clip_eps)
+                    v_loss1 = (values - returns_norm) ** 2
+                    v_loss2 = (values_clipped - returns_norm) ** 2
+                    value_loss = 0.5 * torch.max(v_loss1, v_loss2).mean()
+                else:
+                    value_loss = F.mse_loss(values, returns_norm)
 
                 # Total loss
                 loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
@@ -571,6 +634,7 @@ class PPOAgent:
                 # Auxiliary losses (AlphaPokerNet only)
                 aux_card_loss = torch.tensor(0.0, device=self.device)
                 aux_range_loss = torch.tensor(0.0, device=self.device)
+                aux_action_loss = torch.tensor(0.0, device=self.device)
 
                 if self.use_alpha and warmup > 0:
                     # Card prediction loss (only on showdown hands)
@@ -597,9 +661,24 @@ class PPOAgent:
                                     sd_mask.sum().clamp(min=1)
                         aux_range_loss = range_bce
 
+                    # Action prediction loss (dense training signal for opponent encoder)
+                    aux_action_loss = torch.tensor(0.0, device=self.device)
+                    for opp_i in range(self.num_opponents):
+                        has_target = has_next_act[:, opp_i]
+                        if has_target.any():
+                            game_ctx = F.relu(self.net.game_ctx_proj(x))
+                            pred_input = torch.cat([latents[opp_i], game_ctx], dim=-1)
+                            pred_logits = self.net.action_predictor(pred_input)
+                            target = next_actions[:, opp_i]
+                            act_ce = F.cross_entropy(pred_logits, target, reduction='none')
+                            act_ce = (act_ce * has_target.float()).sum() / has_target.sum().clamp(min=1)
+                            aux_action_loss = aux_action_loss + act_ce
+                    aux_action_loss = aux_action_loss / max(self.num_opponents, 1)
+
                     loss = loss + warmup * (
                         self.aux_card_coef * aux_card_loss +
-                        self.aux_range_coef * aux_range_loss
+                        self.aux_range_coef * aux_range_loss +
+                        self.aux_action_coef * aux_action_loss
                     )
 
                 self.optimizer.zero_grad()
@@ -613,6 +692,7 @@ class PPOAgent:
                 total_entropy += entropy.item()
                 total_aux_card += aux_card_loss.item()
                 total_aux_range += aux_range_loss.item()
+                total_aux_action += aux_action_loss.item()
                 n_updates     += 1
 
         self.train_steps += 1
@@ -628,6 +708,7 @@ class PPOAgent:
         if self.use_alpha:
             metrics["aux_card_loss"]  = total_aux_card  / max(n_updates, 1)
             metrics["aux_range_loss"] = total_aux_range / max(n_updates, 1)
+            metrics["aux_action_loss"] = total_aux_action / max(n_updates, 1)
 
         return metrics
 

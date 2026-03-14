@@ -37,7 +37,7 @@ def demo(n_hands=10, delay=0.8, checkpoint=None, opponent_style="fish",
         render_mode="unicode",
     )
 
-    use_alpha = checkpoint is not None
+    use_alpha = checkpoint is not None or use_search
     agent = PPOAgent(use_alpha=use_alpha,
                      num_opponents=num_players - 1)
     if checkpoint:

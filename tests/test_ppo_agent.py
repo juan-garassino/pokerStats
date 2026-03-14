@@ -121,7 +121,10 @@ def test_alpha_update_with_aux():
         buf.add(obs, Action.RAISE, 0.5, -0.5, 1.0, 0.5, 0.0, mask, opp_ev, opp_mk)
         buf.has_showdown[i] = True
         buf.showdown_cards[i, 0, 0] = 1.0  # some card
+        buf.next_actions[i, 0] = Action.CALL
+        buf.has_next_action[i, 0] = True
 
     metrics = agent.update(buf, ppo_epochs=1, batch_size=16, hand_num=10000)
     assert "aux_card_loss" in metrics
     assert "aux_range_loss" in metrics
+    assert "aux_action_loss" in metrics

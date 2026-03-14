@@ -32,8 +32,8 @@ CFG = {
     "render_every":     5000,    # render table every N hands
 
     # Rollout
-    "rollout_steps":    4096,    # steps per PPO update
-    "batch_size":       512,
+    "rollout_steps":    1024,    # steps per PPO update (lower = more frequent updates)
+    "batch_size":       256,
     "ppo_epochs":       4,
     "gamma":            0.99,
     "gae_lambda":       0.95,
@@ -41,30 +41,33 @@ CFG = {
     # Optimization
     "lr":               2.5e-4,
     "clip_eps":         0.2,
-    "entropy_coef":     0.01,
+    "entropy_coef":     0.02,    # higher entropy to explore raises/re-raises
     "value_coef":       0.5,
 
     # Exploration noise for non-hero seats
-    "opp_epsilon":      0.15,    # probability of random action for opponents
-    "opp_epsilon_decay": 0.9999, # decay per hand (0.15 → ~0.05 over 7K hands)
+    "opp_epsilon":      0.10,    # probability of random action for opponents
+    "opp_epsilon_decay": 0.9999, # decay per hand
+    "temperature_start": 2.0,
+    "temperature_end":   0.5,
+    "temperature_anneal_hands": 200_000,
 
     # Self-play
     "self_play_update_freq":  500,
     "league_size":            8,
     "league_add_freq":        2000,
-    "eval_freq":              1000,
+    "eval_freq":              2000,
     "eval_hands":             500,
     "min_elo_gain":           10.0,
-    "log_freq":               500,      # print stats every N hands
+    "log_freq":               1000,     # print stats every N hands
 
     # Training phases
-    "phase1_hands":     50_000,
+    "phase1_hands":     30_000,
     "phase2_hands":     200_000,
-    "phase3_hands":     50_000,
+    "phase3_hands":     70_000,
 
     # Checkpointing
     "save_dir":         "checkpoints",
-    "save_freq":        5000,
+    "save_freq":        10000,
 }
 
 
@@ -244,12 +247,21 @@ class MultiAgentTrainer:
         # Exploration noise — decays over training
         self.opp_epsilon = cfg.get("opp_epsilon", 0.15)
         self.opp_epsilon_decay = cfg.get("opp_epsilon_decay", 0.9999)
+        self._prev_potential = {}
 
         # Add initial random opponent to league
         rng_agent = PPOAgent(use_alpha=True,
                              num_opponents=self.num_players - 1)
         rng_agent.elo = 1200.0
         self.league.add(rng_agent, tag="random_init")
+
+        # Population diversity — copies with different temperatures
+        self.population = []
+        for pop_temp in [0.8, 1.2, 2.0]:
+            pop_agent = PPOAgent(use_alpha=True, num_opponents=self.num_players - 1)
+            pop_agent._pop_temp = pop_temp
+            self.population.append(pop_agent)
+        self._seat_agents = {}
 
     def _get_opp_context(self, observer_idx: int) -> tuple:
         """
@@ -314,6 +326,32 @@ class MultiAgentTrainer:
                         self.buffers[seat_idx].has_showdown[idx] = True
                 opp_slot += 1
 
+    def _assign_seat_agents(self):
+        """Randomly assign population agents to some non-hero seats."""
+        self._seat_agents = {}
+        for seat in range(1, self.num_players):
+            if seat not in self._scripted_seats and self.population and random.random() < 0.4:
+                self._seat_agents[seat] = random.choice(self.population)
+
+    def _fill_action_targets(self, acting_pidx: int, action: int):
+        """Fill opponent's action as prediction target in all observers' buffers."""
+        for observer in range(self.num_players):
+            if observer == acting_pidx or observer in self._scripted_seats:
+                continue
+            buf = self.buffers[observer]
+            if buf.ptr == 0:
+                continue
+            last_idx = (buf.ptr - 1) % buf.capacity
+            opp_slot = 0
+            for pidx in range(self.num_players):
+                if pidx == observer:
+                    continue
+                if pidx == acting_pidx:
+                    buf.next_actions[last_idx, opp_slot] = action
+                    buf.has_next_action[last_idx, opp_slot] = True
+                    break
+                opp_slot += 1
+
     def _setup_phase(self, phase: int):
         """Configure scripted agents for the given phase."""
         self._scripted_seats = {}
@@ -335,6 +373,9 @@ class MultiAgentTrainer:
         # Record buffer positions at hand start for showdown targets
         hand_start_ptrs = [buf.ptr for buf in self.buffers]
 
+        self._prev_potential = {i: 0.0 for i in range(self.num_players)}
+        self._assign_seat_agents()
+
         step_count = 0
         while not done and step_count < max_steps:
             step_count += 1
@@ -344,35 +385,62 @@ class MultiAgentTrainer:
 
             # Check if this seat uses a scripted agent (phase 3)
             scripted = self._scripted_seats.get(pidx)
+            pop_agent = self._seat_agents.get(pidx)
 
             if scripted is not None:
                 action, raise_frac, _, _, _ = scripted.get_action(o, mask)
                 obs_next, rewards, done, info = self.env.step(action, raise_frac)
                 self.recorder.record(pidx, action, raise_frac,
                                      self.env.pot, self.env.street_idx)
+            elif pop_agent is not None:
+                opp_events, opp_masks = self._get_opp_context(pidx)
+                action, raise_frac, _, _, _ = pop_agent.get_action(
+                    o, mask, opp_events=opp_events, opp_masks=opp_masks,
+                    temperature=getattr(pop_agent, '_pop_temp', 1.0))
+                obs_next, rewards, done, info = self.env.step(action, raise_frac)
+                self.recorder.record(pidx, action, raise_frac,
+                                     self.env.pot, self.env.street_idx)
+                self._fill_action_targets(pidx, action)
             else:
                 # All learning seats use the shared agent
                 opp_events, opp_masks = self._get_opp_context(pidx)
+
+                # Temperature schedule
+                t = min(1.0, self.hand_num / self.cfg.get("temperature_anneal_hands", 200_000))
+                hero_temp = self.cfg.get("temperature_start", 2.0) * (1 - t) + self.cfg.get("temperature_end", 0.5) * t
+                opp_temp = hero_temp * 1.5
+
+                temp = hero_temp if pidx == 0 else opp_temp
                 action, raise_frac, log_prob, value, entropy = \
                     self.agent.get_action(o, mask,
                                           opp_events=opp_events,
-                                          opp_masks=opp_masks)
-
-                # Epsilon-greedy exploration for non-hero seats
-                # Adds diversity so opponents don't all play identically
-                if pidx != 0 and random.random() < self.opp_epsilon:
-                    legal = self.env.legal_actions()
-                    action = random.choice(legal)
-                    raise_frac = random.uniform(0.0, 1.0)
+                                          opp_masks=opp_masks,
+                                          temperature=temp)
 
                 obs_next, rewards, done, info = self.env.step(action, raise_frac)
 
                 # Record action for all observers
                 self.recorder.record(pidx, action, raise_frac,
                                      self.env.pot, self.env.street_idx)
+                self._fill_action_targets(pidx, action)
 
-                # Store in this player's buffer (clip reward to prevent vloss explosion)
-                reward = np.clip(rewards.get(pidx, 0.0), -10.0, 10.0)
+                raw_reward = np.clip(rewards.get(pidx, 0.0), -10.0, 10.0)
+
+                # Potential-based reward shaping (PBRS)
+                hs = o[143]
+                committed = self.env.players[pidx].total_bet / self.env.starting_stack
+                potential = hs * committed * 2.0
+
+                prev_pot = self._prev_potential.get(pidx, 0.0)
+                shaping = self.cfg["gamma"] * potential - prev_pot
+                self._prev_potential[pidx] = potential
+
+                # Fold equity bonus stays
+                if done and raw_reward > 0 and not info.get("showdown", False):
+                    raw_reward += 0.5
+
+                reward = raw_reward + shaping * 0.5
+
                 self.buffers[pidx].add(
                     o, action, raise_frac, log_prob, reward, value,
                     float(done), mask, opp_events, opp_masks
@@ -395,9 +463,6 @@ class MultiAgentTrainer:
         # Hand ended — record events and fill targets
         self._record_hand_events()
         self._fill_showdown_targets(hand_start_ptrs)
-
-        # Decay exploration noise
-        self.opp_epsilon *= self.opp_epsilon_decay
 
         # Track per-seat rewards
         for i in range(self.num_players):
@@ -500,7 +565,7 @@ class MultiAgentTrainer:
                         "step":        self.total_steps,
                         "mean_reward": mean_reward,
                         "win_pct":     np.mean(self.win_hist) if self.win_hist else 0,
-                        "bb_per_100":  mean_reward * 100,
+                        "bb_per_100":  (np.mean(self.reward_hist[0]) if self.reward_hist[0] else 0) * 100,
                         "elo":         self.agent.elo,
                         "hands_per_sec": hps,
                         "phase_pct":   pct,
@@ -508,6 +573,11 @@ class MultiAgentTrainer:
                         **self.last_metrics,
                     }
                     print(render_training_stats(stats), flush=True)
+
+                if self.hand_num % 5000 == 0 and self.population:
+                    for pop_agent in self.population:
+                        pop_agent.net.load_state_dict(self.agent.net.state_dict())
+                        pop_agent._cpu_dirty = True
 
                 if self.hand_num % self.cfg["eval_freq"] == 0:
                     old_elo = self.agent.elo

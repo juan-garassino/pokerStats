@@ -7,10 +7,10 @@ from pokerStats.rl.poker_env import (
 
 
 def test_obs_shape():
-    """Observation vectors have the correct dimension (145)."""
+    """Observation vectors have the correct dimension."""
     env = PokerEnv(num_players=6)
     obs = env.reset()
-    assert OBS_DIM == 145
+    assert OBS_DIM == 148
     for i in range(6):
         assert obs[i].shape == (OBS_DIM,), f"Player {i} obs shape mismatch"
 

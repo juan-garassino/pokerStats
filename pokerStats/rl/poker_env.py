@@ -81,7 +81,10 @@ def raise_frac_to_amount(frac: float, min_raise: float, max_raise: float) -> flo
 # [136:143] last 7 actions normalized
 # [143]     hand strength (0=trash, 1=nuts)
 # [144]     draw potential (0=none, 1=strong draw)
-OBS_DIM = 145
+# [145]     raises_this_street / max_raises (aggression level)
+# [146]     facing_raise (1.0 if must call a raise)
+# [147]     pot_odds (call / (pot + call), 0 if no bet)
+OBS_DIM = 148
 
 STREETS = ["preflop", "flop", "turn", "river"]
 
@@ -252,7 +255,7 @@ class PokerEnv:
         small_blind:     float = 1.0,
         big_blind:       float = 2.0,
         render_mode:     str   = "none",   # "unicode" | "none"
-        max_raises:      int   = 4,        # max raises per street
+        max_raises:      int   = 6,        # max raises per street (allows 4-bet+)
     ):
         self.num_players    = num_players
         self.starting_stack = starting_stack
@@ -682,6 +685,19 @@ class PokerEnv:
                 draw_potential(p.hole_cards, self.community),
             )
         v[143], v[144] = self._hs_cache[cache_key]
+
+        # [145] raises this street (normalized by max_raises)
+        v[145] = self.raises_this_street / max(self.max_raises, 1)
+
+        # [146] facing a raise (1.0 if call_amount > 0 and there's been a raise)
+        call_amt = self._call_amount(player_idx)
+        v[146] = float(call_amt > 0 and self.raises_this_street > 0)
+
+        # [147] pot odds: call / (pot + call) — key for raise/call/fold decisions
+        if call_amt > 0:
+            v[147] = call_amt / (self.pot + call_amt)
+        else:
+            v[147] = 0.0
 
         return v
 
