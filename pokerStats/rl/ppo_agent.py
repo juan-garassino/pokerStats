@@ -561,8 +561,9 @@ class PPOAgent:
                 surr2 = ratio.clamp(1 - self.clip_eps, 1 + self.clip_eps) * advantages
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss
-                value_loss = F.mse_loss(values, returns)
+                # Value loss (normalize returns to prevent explosion)
+                returns_norm = (returns - returns.mean()) / (returns.std() + 1e-8)
+                value_loss = F.mse_loss(values, returns_norm)
 
                 # Total loss
                 loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy

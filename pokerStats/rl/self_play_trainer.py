@@ -44,6 +44,10 @@ CFG = {
     "entropy_coef":     0.01,
     "value_coef":       0.5,
 
+    # Exploration noise for non-hero seats
+    "opp_epsilon":      0.15,    # probability of random action for opponents
+    "opp_epsilon_decay": 0.9999, # decay per hand (0.15 → ~0.05 over 7K hands)
+
     # Self-play
     "self_play_update_freq":  500,
     "league_size":            8,
@@ -51,7 +55,7 @@ CFG = {
     "eval_freq":              1000,
     "eval_hands":             500,
     "min_elo_gain":           10.0,
-    "log_freq":               25,       # print stats every N hands
+    "log_freq":               500,      # print stats every N hands
 
     # Training phases
     "phase1_hands":     50_000,
@@ -237,6 +241,10 @@ class MultiAgentTrainer:
         # Scripted agents for phase 3
         self._scripted_seats = {}  # seat_idx -> ScriptedAgent (or None)
 
+        # Exploration noise — decays over training
+        self.opp_epsilon = cfg.get("opp_epsilon", 0.15)
+        self.opp_epsilon_decay = cfg.get("opp_epsilon_decay", 0.9999)
+
         # Add initial random opponent to league
         rng_agent = PPOAgent(use_alpha=True,
                              num_opponents=self.num_players - 1)
@@ -350,14 +358,21 @@ class MultiAgentTrainer:
                                           opp_events=opp_events,
                                           opp_masks=opp_masks)
 
+                # Epsilon-greedy exploration for non-hero seats
+                # Adds diversity so opponents don't all play identically
+                if pidx != 0 and random.random() < self.opp_epsilon:
+                    legal = self.env.legal_actions()
+                    action = random.choice(legal)
+                    raise_frac = random.uniform(0.0, 1.0)
+
                 obs_next, rewards, done, info = self.env.step(action, raise_frac)
 
                 # Record action for all observers
                 self.recorder.record(pidx, action, raise_frac,
                                      self.env.pot, self.env.street_idx)
 
-                # Store in this player's buffer
-                reward = rewards.get(pidx, 0.0)
+                # Store in this player's buffer (clip reward to prevent vloss explosion)
+                reward = np.clip(rewards.get(pidx, 0.0), -10.0, 10.0)
                 self.buffers[pidx].add(
                     o, action, raise_frac, log_prob, reward, value,
                     float(done), mask, opp_events, opp_masks
@@ -380,6 +395,9 @@ class MultiAgentTrainer:
         # Hand ended — record events and fill targets
         self._record_hand_events()
         self._fill_showdown_targets(hand_start_ptrs)
+
+        # Decay exploration noise
+        self.opp_epsilon *= self.opp_epsilon_decay
 
         # Track per-seat rewards
         for i in range(self.num_players):
