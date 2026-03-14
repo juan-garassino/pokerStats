@@ -32,6 +32,60 @@ install:
 
 all: clean install test black check_code
 
+# ----------------------------------
+#          RL TRAINING
+# ----------------------------------
+
+train:
+	python -m pokerStats.rl.self_play_trainer
+
+train-render:
+	python -m pokerStats.rl.self_play_trainer --render
+
+eval-rl:
+	python scripts/eval_rl.py
+
+# Colab training (configurable hand counts)
+PHASE1_HANDS ?= 20000
+PHASE2_HANDS ?= 50000
+PHASE3_HANDS ?= 20000
+
+train-colab:
+	python -c "from pokerStats.rl.self_play_trainer import SelfPlayTrainer, CFG; \
+		CFG['phase1_hands']=$(PHASE1_HANDS); \
+		CFG['phase2_hands']=$(PHASE2_HANDS); \
+		CFG['phase3_hands']=$(PHASE3_HANDS); \
+		CFG['render_every']=999999; \
+		SelfPlayTrainer(CFG).train()"
+
+train-colab-quick:
+	$(MAKE) train-colab PHASE1_HANDS=5000 PHASE2_HANDS=10000 PHASE3_HANDS=5000
+
+train-colab-full:
+	$(MAKE) train-colab PHASE1_HANDS=50000 PHASE2_HANDS=200000 PHASE3_HANDS=50000
+
+# Watch random agent play 10 hands (no checkpoint needed)
+demo:
+	python scripts/demo_play.py --hands 10 --delay 0.5 --players 3
+
+# Watch random agent vs different opponents
+demo-vs-maniac:
+	python scripts/demo_play.py --hands 10 --opponent maniac --players 3
+
+demo-vs-nit:
+	python scripts/demo_play.py --hands 10 --opponent nit --players 3
+
+demo-vs-tag:
+	python scripts/demo_play.py --hands 10 --opponent tight-aggressive --players 4
+
+# Watch a trained agent play (after training or downloading a checkpoint)
+demo-trained:
+	python scripts/demo_play.py --hands 10 --checkpoint checkpoints/best.pt --opponent fish --players 3
+
+# Full table 6-max demo
+demo-6max:
+	python scripts/demo_play.py --hands 5 --players 6 --delay 0.3
+
 count_lines:
 	@find ./ -name '*.py' -exec  wc -l {} \; | sort -n| awk \
         '{printf "%4s %s\n", $$1, $$2}{s+=$$0}END{print s}'

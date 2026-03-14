@@ -1,0 +1,27 @@
+# PokerStars Autonomous Agent — full requirements
+# pip install -r requirements.txt
+
+# Vision
+ultralytics>=8.2.0         # YOLOv8 training + inference
+opencv-python>=4.9.0
+mss>=9.0.1                 # fast cross-platform screen capture
+Pillow>=10.0.0
+pytesseract>=0.3.10        # OCR for stacks/names (also: brew/apt install tesseract)
+
+# UI automation
+pyautogui>=0.9.54          # mouse/keyboard control
+# Linux:  sudo apt install python3-xlib scrot
+# macOS:  grant Accessibility permissions to Terminal
+
+# Poker math
+treys>=0.1.0               # fast hand evaluator (pure Python)
+# phevaluator>=0.5.0       # optional: C++ evaluator, ~10ns/eval
+
+# Agent / RL (optional, for CFR/GTO trees)
+# openspiel                # install from source: github.com/google-deepmind/open_spiel
+
+# Core
+numpy>=1.26.0
+torch>=2.2.0               # required by ultralytics
+dataclasses-json>=0.6.4
+loguru>=0.7.2
