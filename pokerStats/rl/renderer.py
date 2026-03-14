@@ -63,73 +63,137 @@ def render_hand(cards: list, hidden: bool = False, label: str = "") -> str:
     return f"{prefix}{glyphs}"
 
 
+def equity_bar(equity: float, width: int = 10) -> str:
+    """Render an equity gauge: ▰▰▰▰▰▰▰▱▱▱ 72%"""
+    filled = int(equity * width)
+    bar = "\u25b0" * filled + "\u25b1" * (width - filled)
+    if equity >= 0.65:
+        col = GREEN
+    elif equity >= 0.40:
+        col = YELLOW
+    else:
+        col = RED
+    return f"{col}{bar}{RESET} {equity * 100:.0f}%"
+
+
+# Position labels by seat offset from dealer
+_POS_LABELS_6 = ["BTN", "SB", "BB", "UTG", "MP", "CO"]
+_POS_LABELS_3 = ["BTN", "SB", "BB"]
+_POS_LABELS_2 = ["BTN", "BB"]
+
+
+def _pos_label(seat_idx: int, dealer_idx: int, num_players: int) -> str:
+    """Get position label for a seat."""
+    if num_players <= 2:
+        labels = _POS_LABELS_2
+    elif num_players <= 3:
+        labels = _POS_LABELS_3
+    else:
+        labels = _POS_LABELS_6
+    offset = (seat_idx - dealer_idx) % num_players
+    if offset < len(labels):
+        return labels[offset]
+    return f"S{seat_idx}"
+
+
 def render_table(state: dict) -> str:
     """
-    Full table view with Unicode cards during training.
+    Compact table view — two main lines + optional action line.
 
-    state keys: hole_cards, community_cards, pot, stacks, street,
-                current_player, last_actions, hand_num, episode, players
+    Line 1: hand/street + board cards + pot + equity bar
+    Line 2: all players inline with position tags
+    Line 3: (optional) last actions
+
+    state keys: community_cards, pot, street, current_player, players,
+                hand_num, episode, last_actions, showdown,
+                dealer_idx (optional), hero_equity (optional)
     """
-    sep = "\u2500" * 58
     lines = []
 
-    # Header
-    ep   = state.get("episode", 0)
-    hand = state.get("hand_num", 0)
+    # ── Line 1: board state ──────────────────────────────────────────────
+    hand   = state.get("hand_num", 0)
     street = state.get("street", "preflop").upper()
-    lines.append(f"\n{sep}")
-    lines.append(f"  {BOLD}Episode {ep}  Hand {hand}  [{street}]{RESET}")
-    lines.append(sep)
 
-    # Board
     board = state.get("community_cards", [])
     board_glyphs = []
     for c in board:
         col = SUIT_COLOR.get(c[1], "")
         board_glyphs.append(f"{col}{card_unicode(c)}{RESET}")
-    # Pad to 5 slots
     while len(board_glyphs) < 5:
-        board_glyphs.append("__")
+        board_glyphs.append(f"{GRAY}__{RESET}")
 
     pot = state.get("pot", 0)
-    lines.append(f"  Board: {'  '.join(board_glyphs)}          Pot: ${pot:.2f}")
-    lines.append("")
+    hero_eq = state.get("hero_equity", -1)
 
-    # Players
-    players = state.get("players", [])
-    cur = state.get("current_player", -1)
+    eq_str = ""
+    if hero_eq >= 0:
+        eq_str = f"  {equity_bar(hero_eq)}"
+
+    lines.append(
+        f"  {BOLD}#{hand} [{street}]{RESET}  "
+        f"{'  '.join(board_glyphs)}  "
+        f"pot ${pot:.0f}{eq_str}"
+    )
+
+    # ── Line 2: players ──────────────────────────────────────────────────
+    players    = state.get("players", [])
+    cur        = state.get("current_player", -1)
+    dealer_idx = state.get("dealer_idx", 0)
+    n_players  = len(players)
+    showdown   = state.get("showdown", False)
+
+    parts = []
     for i, p in enumerate(players):
-        marker  = f"{GREEN}\u25ba{RESET}" if i == cur else " "
-        name    = p.get("name", f"Agent-{i}")
-        stack   = p.get("stack", 0)
-        bet     = p.get("current_bet", 0)
-        folded  = p.get("folded", False)
+        name   = p.get("name", f"P{i}")
+        stack  = p.get("stack", 0)
+        bet    = p.get("current_bet", 0)
+        folded = p.get("folded", False)
         is_hero = p.get("is_hero", False)
-        cards   = p.get("hole_cards", [])
-        show    = is_hero or state.get("showdown", False)
+        cards  = p.get("hole_cards", [])
+        show   = is_hero or showdown
 
-        status = f"{GRAY}FOLDED{RESET}" if folded else f"bet=${bet:.2f}"
-        label  = f"{BOLD}{name}{RESET}" if is_hero else name
+        # Position tag
+        pos = _pos_label(i, dealer_idx, n_players)
 
-        if cards and show:
-            card_str = " ".join(
+        # Marker
+        marker = f"{GREEN}\u25ba{RESET}" if i == cur else " "
+
+        # Name + position
+        if is_hero:
+            tag = f"{BOLD}{name}{RESET}[{YELLOW}{pos}{RESET}]"
+        else:
+            tag = f"{name}[{GRAY}{pos}{RESET}]"
+
+        # Cards
+        if folded:
+            card_str = f"{GRAY}--{RESET}"
+        elif cards and show:
+            card_str = "".join(
                 f"{SUIT_COLOR.get(c[1], '')}{card_unicode(c)}{RESET}" for c in cards
             )
         elif cards:
-            card_str = " ".join(CARD_BACK for _ in cards)
+            card_str = "".join(CARD_BACK for _ in cards)
         else:
             card_str = ""
 
-        lines.append(f"  {marker} {label:20s} {card_str}   stack=${stack:8.2f}  {status}")
+        # Stack + bet
+        if folded:
+            info = f"{GRAY}fold{RESET}"
+        elif bet > 0:
+            info = f"${stack:.0f} bet${bet:.0f}"
+        else:
+            info = f"${stack:.0f}"
 
-    # Recent actions
+        parts.append(f"{marker}{tag} {card_str} {info}")
+
+    lines.append("  " + "  " + "  ".join(parts))
+
+    # ── Line 3: recent actions (compact) ─────────────────────────────────
     last = state.get("last_actions", [])
     if last:
-        lines.append("")
         recent = " \u2192 ".join(last[-4:])
-        lines.append(f"  {GRAY}Recent: {recent}{RESET}")
+        lines.append(f"  {GRAY}{recent}{RESET}")
 
-    lines.append(sep)
     return "\n".join(lines)
 
 
@@ -177,6 +241,10 @@ if __name__ == "__main__":
     print(render_hand(["Ah", "Ks"], label="Hero"))
     print(render_hand(["2c", "7d", "Jh"], label="Flop"))
     print()
+    print("Equity examples:")
+    for eq in [0.15, 0.42, 0.72, 0.95]:
+        print(f"  {equity_bar(eq)}")
+    print()
 
     demo_state = {
         "episode": 1024,
@@ -185,21 +253,32 @@ if __name__ == "__main__":
         "community_cards": ["Ah", "7c", "2d"],
         "pot": 45.50,
         "current_player": 0,
+        "dealer_idx": 0,
+        "hero_equity": 0.72,
         "showdown": False,
         "players": [
             {"name": "Hero", "stack": 182.0, "current_bet": 20.0,
              "folded": False, "hole_cards": ["Kh", "Qh"], "is_hero": True},
-            {"name": "PPO-Agent-2", "stack": 210.0, "current_bet": 20.0,
+            {"name": "V1", "stack": 210.0, "current_bet": 20.0,
              "folded": False, "hole_cards": ["Tc", "9c"], "is_hero": False},
-            {"name": "PPO-Agent-3", "stack": 0.0, "current_bet": 0.0,
+            {"name": "V2", "stack": 0.0, "current_bet": 0.0,
              "folded": True, "hole_cards": ["5s", "3d"], "is_hero": False},
         ],
         "last_actions": [
-            "Agent-2 raise $20",
-            "Agent-3 fold",
+            "V1 raise $20",
+            "V2 fold",
             "Hero call $20",
         ],
     }
+    print(render_table(demo_state))
+
+    # Showdown
+    print()
+    demo_state["showdown"] = True
+    demo_state["street"] = "river"
+    demo_state["community_cards"] = ["Ah", "7c", "2d", "Kd", "3s"]
+    demo_state["hero_equity"] = 0.91
+    demo_state["pot"] = 90.0
     print(render_table(demo_state))
 
     # Training stats demo

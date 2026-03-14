@@ -105,6 +105,8 @@ CFR_DIR ?= checkpoints/cfr
 CFR_BUCKETS ?= 50
 CFR_SAMPLES ?= 1000
 CFR_ITERS ?= 5000
+CFR_RENDER ?= 500
+CFR_LOG ?= 500
 CFR_MIN_VISITS ?= 1
 
 # Full CFR pipeline: abstraction → solve → blueprint
@@ -120,7 +122,9 @@ cfr-abstraction:
 cfr-solve:
 	python scripts/train_cfr.py --phase solve \
 		--output-dir $(CFR_DIR) \
-		--iterations $(CFR_ITERS)
+		--iterations $(CFR_ITERS) \
+		--render-every $(CFR_RENDER) \
+		--log-every $(CFR_LOG)
 
 cfr-blueprint:
 	python scripts/train_cfr.py --phase blueprint \
@@ -132,17 +136,19 @@ cfr-resume:
 	python scripts/train_cfr.py --phase solve \
 		--output-dir $(CFR_DIR) \
 		--iterations $(CFR_ITERS) \
+		--render-every $(CFR_RENDER) \
+		--log-every $(CFR_LOG) \
 		--resume $(CFR_DIR)/solver_final.npz
 
-# Presets
+# Presets (all include rendered demo hands)
 cfr-colab-quick:
-	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=1000
+	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=1000 CFR_RENDER=500 CFR_LOG=500
 
 cfr-colab:
-	$(MAKE) cfr-train CFR_BUCKETS=50 CFR_SAMPLES=1000 CFR_ITERS=5000
+	$(MAKE) cfr-train CFR_BUCKETS=50 CFR_SAMPLES=1000 CFR_ITERS=5000 CFR_RENDER=500 CFR_LOG=500
 
 cfr-colab-full:
-	$(MAKE) cfr-train CFR_BUCKETS=200 CFR_SAMPLES=10000 CFR_ITERS=100000
+	$(MAKE) cfr-train CFR_BUCKETS=200 CFR_SAMPLES=10000 CFR_ITERS=100000 CFR_RENDER=500 CFR_LOG=500
 
 # Test Kuhn poker convergence (instant sanity check)
 cfr-test-kuhn:

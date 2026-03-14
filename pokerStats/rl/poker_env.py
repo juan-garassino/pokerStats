@@ -715,6 +715,8 @@ class PokerEnv:
 
     # ── Unicode render ────────────────────────────────────────────────────────
     def _render_unicode(self) -> str:
+        hero = self.players[0]
+        hero_eq = hand_strength(hero.hole_cards, self.community) if hero.hole_cards else -1
         return render_table({
             "episode":          self.episode,
             "hand_num":         self.hand_num,
@@ -722,10 +724,12 @@ class PokerEnv:
             "community_cards":  self.community,
             "pot":              self.pot,
             "current_player":   self.current_player,
+            "dealer_idx":       self.dealer_idx,
+            "hero_equity":      hero_eq,
             "showdown":         self._done,
             "players": [
                 {
-                    "name":        f"Agent-{p.idx}",
+                    "name":        f"P{p.idx}",
                     "stack":       p.stack,
                     "current_bet": p.current_bet,
                     "folded":      p.folded,
