@@ -156,7 +156,8 @@ class OpponentEncoder(nn.Module):
             dropout=0.0,
         )
         self.transformer = nn.TransformerEncoder(
-            encoder_layer, num_layers=num_layers
+            encoder_layer, num_layers=num_layers,
+            enable_nested_tensor=False,  # nested tensors cause NaN with padded masks
         )
 
         # Project to latent dim
