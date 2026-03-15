@@ -482,8 +482,8 @@ class PPOAgent:
         self.optimizer    = torch.optim.Adam(self.net.parameters(), lr=lr, eps=1e-5)
         self.clip_eps     = clip_eps
         self.entropy_coef = entropy_coef
-        self.entropy_floor = 0.3        # adaptive boost kicks in below this
-        self.entropy_boost = 3.0        # multiplier when below floor
+        self.entropy_floor = 0.6        # adaptive boost kicks in below this
+        self.entropy_boost = 5.0        # multiplier when below floor (0.05 * 5 = 0.25)
         self.value_coef   = value_coef
         self.max_grad_norm= max_grad_norm
         self.train_steps  = 0

@@ -50,7 +50,7 @@ CFG = {
     # Optimization
     "lr":               2.5e-4,
     "clip_eps":         0.2,
-    "entropy_coef":     0.05,    # prevent entropy collapse (all-in spam)
+    "entropy_coef":     0.08,    # prevent entropy collapse (all-in spam)
     "value_coef":       0.5,
 
     # Exploration noise for non-hero seats
