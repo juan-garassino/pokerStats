@@ -629,8 +629,9 @@ class PPOAgent:
                     logits, raise_alpha, raise_beta, values = self.net(obs, masks)
 
                 # NaN guard — skip corrupted batches
-                if torch.isnan(logits).any() or torch.isinf(logits).any():
-                    print("  [WARN] NaN/Inf in logits — skipping batch")
+                # Note: -inf is expected in masked positions (legal_mask), only check for NaN
+                if torch.isnan(logits).any():
+                    print("  [WARN] NaN in logits — skipping batch")
                     continue
 
                 # Discrete action log prob
