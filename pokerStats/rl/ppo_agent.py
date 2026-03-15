@@ -482,6 +482,8 @@ class PPOAgent:
         self.optimizer    = torch.optim.Adam(self.net.parameters(), lr=lr, eps=1e-5)
         self.clip_eps     = clip_eps
         self.entropy_coef = entropy_coef
+        self.entropy_floor = 0.3        # adaptive boost kicks in below this
+        self.entropy_boost = 3.0        # multiplier when below floor
         self.value_coef   = value_coef
         self.max_grad_norm= max_grad_norm
         self.train_steps  = 0
@@ -665,8 +667,11 @@ class PPOAgent:
                 else:
                     value_loss = F.mse_loss(values, returns_norm)
 
-                # Total loss
-                loss = policy_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+                # Total loss — adaptive entropy: boost coefficient when entropy collapses
+                ent_coef = self.entropy_coef
+                if entropy.item() < self.entropy_floor:
+                    ent_coef = self.entropy_coef * self.entropy_boost
+                loss = policy_loss + self.value_coef * value_loss - ent_coef * entropy
 
                 # Auxiliary losses (AlphaPokerNet only)
                 aux_card_loss = torch.tensor(0.0, device=self.device)

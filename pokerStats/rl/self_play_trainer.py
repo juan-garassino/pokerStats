@@ -50,7 +50,7 @@ CFG = {
     # Optimization
     "lr":               2.5e-4,
     "clip_eps":         0.2,
-    "entropy_coef":     0.02,    # higher entropy to explore raises/re-raises
+    "entropy_coef":     0.05,    # prevent entropy collapse (all-in spam)
     "value_coef":       0.5,
 
     # Exploration noise for non-hero seats
@@ -468,7 +468,20 @@ class MultiAgentTrainer:
                 if done and raw_reward > 0 and not info.get("showdown", False):
                     raw_reward += 0.5
 
-                reward = raw_reward + shaping * 0.5
+                # All-in shaping: reward scales with hand strength
+                # Strong hand (hs>0.7) + all-in = small bonus (good leverage)
+                # Weak hand (hs<0.3) + all-in = penalty (reckless shove)
+                # This teaches WHEN to go all-in, not to avoid it entirely
+                allin_shaping = 0.0
+                if action == Action.ALL_IN:
+                    # Asymmetric: harsh penalty for bad all-ins, moderate bonus for good ones
+                    # hs=0.0 → -1.0, hs=0.5 → -0.2, hs=0.7 → +0.1, hs=1.0 → +0.4
+                    if hs < 0.5:
+                        allin_shaping = (hs - 0.5) * 2.0   # range: -1.0 to 0.0
+                    else:
+                        allin_shaping = (hs - 0.5) * 0.8   # range: 0.0 to +0.4
+
+                reward = raw_reward + shaping * 0.5 + allin_shaping
 
                 # CFR distillation target
                 cfr_target = None
