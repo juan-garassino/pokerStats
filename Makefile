@@ -131,44 +131,68 @@ train-unified-6max:
 train-unified-8max:
 	$(MAKE) train-unified NUM_PLAYERS=8
 
-# ── Step 1: CFR on CPU (cheap Colab instance, no GPU needed) ──
-# Run this first, then `make zip-output` to download blueprint
-# Benchmark: 5k iters = 4 hours on Colab CPU (0.5 iter/s)
-cfr-cpu-quick:
-	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=500 CFR_RENDER=250 CFR_LOG=250
+# ── Step 1: CFR on CPU (no GPU needed) ───────────────────
+# Benchmark: 0.5 iter/s on Colab CPU
+#   XS=1k (~35min)  S=3k (~2.5h)  M=10k (~8h)  L=50k (~3days)  XL=500k (weeks)
 
-cfr-cpu:
+cfr-xs:
 	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=1000 CFR_RENDER=500 CFR_LOG=500
 
-cfr-cpu-full:
+cfr-s:
 	$(MAKE) cfr-train CFR_BUCKETS=30 CFR_SAMPLES=500 CFR_ITERS=3000 CFR_RENDER=1000 CFR_LOG=1000
 
-# ── Step 2: PPO+distillation on GPU (needs blueprint from step 1) ──
+cfr-m:
+	$(MAKE) cfr-train CFR_BUCKETS=50 CFR_SAMPLES=1000 CFR_ITERS=10000 CFR_RENDER=2000 CFR_LOG=2000
+
+cfr-l:
+	$(MAKE) cfr-train CFR_BUCKETS=200 CFR_SAMPLES=5000 CFR_ITERS=50000 CFR_RENDER=10000 CFR_LOG=5000
+
+cfr-xl:
+	$(MAKE) cfr-train CFR_BUCKETS=500 CFR_SAMPLES=10000 CFR_ITERS=500000 CFR_RENDER=50000 CFR_LOG=50000
+
+# ── Step 2: PPO+distillation on GPU (needs blueprint) ───
 # Upload blueprint via zip-output from step 1, then run this
-ppo-gpu-quick:
+
+ppo-xs:
 	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
 		PHASE1_HANDS=5000 PHASE2_HANDS=10000 PHASE3_HANDS=5000
 
-ppo-gpu:
+ppo-s:
+	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
+		PHASE1_HANDS=10000 PHASE2_HANDS=30000 PHASE3_HANDS=10000
+
+ppo-m:
 	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
 		PHASE1_HANDS=20000 PHASE2_HANDS=50000 PHASE3_HANDS=20000
 
-ppo-gpu-full:
+ppo-l:
 	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
 		PHASE1_HANDS=50000 PHASE2_HANDS=200000 PHASE3_HANDS=50000
 
-# ── All-in-one (if you want both on same instance) ──────
-train-unified-colab-quick:
-	$(MAKE) cfr-cpu-quick
-	$(MAKE) ppo-gpu-quick
+ppo-xl:
+	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
+		PHASE1_HANDS=100000 PHASE2_HANDS=500000 PHASE3_HANDS=100000
 
-train-unified-colab:
-	$(MAKE) cfr-cpu
-	$(MAKE) ppo-gpu
+# ── All-in-one (both steps on same instance) ────────────
+train-xs:
+	$(MAKE) cfr-xs
+	$(MAKE) ppo-xs
 
-train-unified-colab-full:
-	$(MAKE) cfr-cpu-full
-	$(MAKE) ppo-gpu-full
+train-s:
+	$(MAKE) cfr-s
+	$(MAKE) ppo-s
+
+train-m:
+	$(MAKE) cfr-m
+	$(MAKE) ppo-m
+
+train-l:
+	$(MAKE) cfr-l
+	$(MAKE) ppo-l
+
+train-xl:
+	$(MAKE) cfr-xl
+	$(MAKE) ppo-xl
 
 # Watch random agent play 10 hands (no checkpoint needed)
 demo:

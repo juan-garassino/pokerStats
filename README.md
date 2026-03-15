@@ -117,19 +117,17 @@ files.download('pokerStats-output.zip')
 !make train-unified-colab NUM_PLAYERS=6
 ```
 
-| CFR preset | Command | Time (CPU) | Iterations |
-|------------|---------|-----------|------------|
-| Quick | `cfr-cpu-quick` | ~15 min | 500 |
-| Medium | `cfr-cpu` | ~35 min | 1,000 |
-| Full | `cfr-cpu-full` | ~2.5 hours | 3,000 |
+| Size | CFR | PPO | Time (Colab) | Human equivalent |
+|------|-----|-----|-------------|-----------------|
+| **XS** | `cfr-xs` 1k iters | `ppo-xs` 20k hands | ~1h | **Drunk tourist** — knows the rules, folds or calls randomly, occasionally stumbles into a win |
+| **S** | `cfr-s` 3k iters | `ppo-s` 50k hands | ~4h | **Home game regular** — understands position and pot odds, won't throw away strong hands, but bluffs poorly and overplays medium holdings |
+| **M** | `cfr-m` 10k iters | `ppo-m` 90k hands | ~12h | **Casino 1/2 NL grinder** — solid TAG style, knows when to fold, sizes bets reasonably, exploits obvious fish. Profitable at low stakes |
+| **L** | `cfr-l` 50k iters | `ppo-l` 300k hands | ~4 days | **Online 200NL regular** — near-GTO preflop, balanced bluff/value ranges, adjusts to opponents. Beats most live players convincingly |
+| **XL** | `cfr-xl` 500k iters | `ppo-xl` 700k hands | Weeks | **High-stakes pro** — GTO baseline with precise exploits, balanced across all streets, almost impossible to read. Crushes anything below nosebleeds |
 
-> Benchmark: 5k iterations = 4 hours on Colab CPU (0.5 iter/s)
-
-| PPO preset | Command | Time (GPU) | Total hands |
-|------------|---------|-----------|-------------|
-| Quick | `ppo-gpu-quick` | ~20 min | 20k |
-| Medium | `ppo-gpu` | ~1-2 hours | 90k |
-| Full | `ppo-gpu-full` | ~4-6 hours | 300k |
+> Benchmark: 0.5 iter/s on Colab CPU. All-in-one: `make train-s NUM_PLAYERS=6`
+>
+> CFR runs on CPU, PPO runs on GPU. Run them separately to save costs (see workflow below).
 
 ### Watch a trained agent play
 
@@ -174,26 +172,17 @@ pokerStats/
 
 ## Make targets reference
 
-### Training (separate CPU/GPU steps)
+### Training
 
-| Target | Hardware | Time | Description |
-|--------|----------|------|-------------|
-| `cfr-cpu-quick` | CPU | ~15 min | CFR blueprint, 500 iterations |
-| `cfr-cpu` | CPU | ~35 min | CFR blueprint, 1k iterations |
-| `cfr-cpu-full` | CPU | ~2.5 hours | CFR blueprint, 3k iterations |
-| `ppo-gpu-quick` | GPU | ~20 min | PPO + distillation, 20k hands |
-| `ppo-gpu` | GPU | ~1-2 hours | PPO + distillation, 90k hands |
-| `ppo-gpu-full` | GPU | ~4-6 hours | PPO + distillation, 300k hands |
+| Size | CPU step | GPU step | All-in-one | Human equivalent |
+|------|----------|----------|------------|-----------------|
+| XS | `cfr-xs` (~35 min) | `ppo-xs` | `train-xs` | Drunk tourist |
+| S | `cfr-s` (~2.5h) | `ppo-s` | `train-s` | Home game regular |
+| M | `cfr-m` (~8h) | `ppo-m` | `train-m` | Casino 1/2 grinder |
+| L | `cfr-l` (~3 days) | `ppo-l` | `train-l` | Online 200NL reg |
+| XL | `cfr-xl` (weeks) | `ppo-xl` | `train-xl` | High-stakes pro |
 
-### Training (all-in-one)
-
-| Target | Description |
-|--------|-------------|
-| `train-unified-colab-quick` | CFR + PPO on same instance |
-| `train-unified-colab` | CFR + PPO on same instance |
-| `train-unified-colab-full` | CFR + PPO on same instance |
-| `train-colab` | Pure PPO (add `USE_CFR=1` for distillation) |
-| `train-hybrid` | Separate CFR + PPO blended at inference |
+All accept `NUM_PLAYERS=6`. Pure PPO without distillation: `make train-colab`.
 
 ### Demos
 

@@ -9,11 +9,15 @@ The most practical CFR variant for NLHE:
 - Converges to Nash equilibrium in two-player zero-sum games
 """
 
+import sys
 import random
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional
 from pathlib import Path
+
+# Deep raise-reraise sequences can exceed default recursion limit
+sys.setrecursionlimit(10_000)
 
 from pokerStats.rl.poker_env import (
     PokerEnv, Action, NUM_ACTIONS, STREETS,
@@ -123,6 +127,8 @@ class CFRSolver:
     Alternates which player is the "traverser" each iteration.
     """
 
+    MAX_DEPTH = 50  # max actions per hand before forced evaluation
+
     def __init__(self, abstraction: Optional[HandAbstraction] = None):
         self.abstraction = abstraction or HandAbstraction()
         self.info_sets: dict = {}  # key → InfoSet
@@ -168,6 +174,10 @@ class CFRSolver:
         """
         # Terminal check
         if env._done:
+            return env._rewards.get(traversing_player, 0.0)
+
+        # Depth limit: treat excessively long action sequences as terminal
+        if len(action_history) >= self.MAX_DEPTH:
             return env._rewards.get(traversing_player, 0.0)
 
         current = env.current_player
@@ -280,6 +290,9 @@ class CFRSolver:
     ) -> float:
         """Compute best-response value for br_player against opponent's average strategy."""
         if env._done:
+            return env._rewards.get(br_player, 0.0)
+
+        if len(action_history) >= self.MAX_DEPTH:
             return env._rewards.get(br_player, 0.0)
 
         current = env.current_player
