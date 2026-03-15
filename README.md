@@ -119,13 +119,15 @@ files.download('pokerStats-output.zip')
 
 | Size | CFR | PPO | Time (Colab) | Human equivalent |
 |------|-----|-----|-------------|-----------------|
+| **XXS** | `cfr-xxs` 100 iters | `ppo-xxs` 2k hands | ~5 min | **Pipeline test** — verifies everything runs end-to-end, learns nothing |
 | **XS** | `cfr-xs` 1k iters | `ppo-xs` 20k hands | ~1h | **Drunk tourist** — knows the rules, folds or calls randomly, occasionally stumbles into a win |
 | **S** | `cfr-s` 3k iters | `ppo-s` 50k hands | ~4h | **Home game regular** — understands position and pot odds, won't throw away strong hands, but bluffs poorly and overplays medium holdings |
 | **M** | `cfr-m` 10k iters | `ppo-m` 90k hands | ~12h | **Casino 1/2 NL grinder** — solid TAG style, knows when to fold, sizes bets reasonably, exploits obvious fish. Profitable at low stakes |
 | **L** | `cfr-l` 50k iters | `ppo-l` 300k hands | ~4 days | **Online 200NL regular** — near-GTO preflop, balanced bluff/value ranges, adjusts to opponents. Beats most live players convincingly |
-| **XL** | `cfr-xl` 500k iters | `ppo-xl` 700k hands | Weeks | **High-stakes pro** — GTO baseline with precise exploits, balanced across all streets, almost impossible to read. Crushes anything below nosebleeds |
+| **XL** | `cfr-xl` 250k iters | `ppo-xl` 500k hands | ~2 weeks | **High-stakes reg** — strong GTO baseline with precise exploits, balanced across all streets, very hard to read |
+| **XXL** | `cfr-xxl` 500k iters | `ppo-xxl` 700k hands | Weeks+ | **Nosebleed pro** — near-perfect GTO, surgical exploitation, crushes anything below the highest stakes |
 
-> Benchmark: 0.5 iter/s on Colab CPU. All-in-one: `make train-s NUM_PLAYERS=6`
+> Benchmark: ~0.5 iter/s on Colab CPU. All-in-one: `make train-s NUM_PLAYERS=6`
 >
 > CFR runs on CPU, PPO runs on GPU. Run them separately to save costs (see workflow below).
 
@@ -176,11 +178,13 @@ pokerStats/
 
 | Size | CPU step | GPU step | All-in-one | Human equivalent |
 |------|----------|----------|------------|-----------------|
+| XXS | `cfr-xxs` (~3 min) | `ppo-xxs` | `train-xxs` | Pipeline test |
 | XS | `cfr-xs` (~35 min) | `ppo-xs` | `train-xs` | Drunk tourist |
 | S | `cfr-s` (~2.5h) | `ppo-s` | `train-s` | Home game regular |
 | M | `cfr-m` (~8h) | `ppo-m` | `train-m` | Casino 1/2 grinder |
 | L | `cfr-l` (~3 days) | `ppo-l` | `train-l` | Online 200NL reg |
-| XL | `cfr-xl` (weeks) | `ppo-xl` | `train-xl` | High-stakes pro |
+| XL | `cfr-xl` (~2 weeks) | `ppo-xl` | `train-xl` | High-stakes reg |
+| XXL | `cfr-xxl` (weeks+) | `ppo-xxl` | `train-xxl` | Nosebleed pro |
 
 All accept `NUM_PLAYERS=6`. Pure PPO without distillation: `make train-colab`.
 

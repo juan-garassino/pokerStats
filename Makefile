@@ -132,8 +132,12 @@ train-unified-8max:
 	$(MAKE) train-unified NUM_PLAYERS=8
 
 # ── Step 1: CFR on CPU (no GPU needed) ───────────────────
-# Benchmark: 0.5 iter/s on Colab CPU
-#   XS=1k (~35min)  S=3k (~2.5h)  M=10k (~8h)  L=50k (~3days)  XL=500k (weeks)
+# Benchmark: ~0.5 iter/s on Colab CPU
+#   XXS=100 (~3min)  XS=1k (~35min)  S=3k (~2.5h)  M=10k (~8h)
+#   L=50k (~3days)   XL=250k (~2wks)  XXL=500k (weeks)
+
+cfr-xxs:
+	$(MAKE) cfr-train CFR_BUCKETS=10 CFR_SAMPLES=100 CFR_ITERS=100 CFR_RENDER=50 CFR_LOG=50
 
 cfr-xs:
 	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=1000 CFR_RENDER=500 CFR_LOG=500
@@ -148,10 +152,17 @@ cfr-l:
 	$(MAKE) cfr-train CFR_BUCKETS=200 CFR_SAMPLES=5000 CFR_ITERS=50000 CFR_RENDER=10000 CFR_LOG=5000
 
 cfr-xl:
+	$(MAKE) cfr-train CFR_BUCKETS=350 CFR_SAMPLES=7500 CFR_ITERS=250000 CFR_RENDER=25000 CFR_LOG=25000
+
+cfr-xxl:
 	$(MAKE) cfr-train CFR_BUCKETS=500 CFR_SAMPLES=10000 CFR_ITERS=500000 CFR_RENDER=50000 CFR_LOG=50000
 
 # ── Step 2: PPO+distillation on GPU (needs blueprint) ───
 # Upload blueprint via zip-output from step 1, then run this
+
+ppo-xxs:
+	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
+		PHASE1_HANDS=500 PHASE2_HANDS=1000 PHASE3_HANDS=500
 
 ppo-xs:
 	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
@@ -171,9 +182,17 @@ ppo-l:
 
 ppo-xl:
 	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
+		PHASE1_HANDS=75000 PHASE2_HANDS=350000 PHASE3_HANDS=75000
+
+ppo-xxl:
+	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
 		PHASE1_HANDS=100000 PHASE2_HANDS=500000 PHASE3_HANDS=100000
 
 # ── All-in-one (both steps on same instance) ────────────
+train-xxs:
+	$(MAKE) cfr-xxs
+	$(MAKE) ppo-xxs
+
 train-xs:
 	$(MAKE) cfr-xs
 	$(MAKE) ppo-xs
@@ -193,6 +212,10 @@ train-l:
 train-xl:
 	$(MAKE) cfr-xl
 	$(MAKE) ppo-xl
+
+train-xxl:
+	$(MAKE) cfr-xxl
+	$(MAKE) ppo-xxl
 
 # Watch random agent play 10 hands (no checkpoint needed)
 demo:
@@ -301,6 +324,7 @@ zip-repo:
 	@ls -lh pokerStats-repo.zip
 
 # ── Zip outputs (download from Colab) ───────────────────
+# zip-output: everything (CFR + PPO checkpoints + data)
 zip-output:
 	@rm -f pokerStats-output.zip
 	zip -r pokerStats-output.zip \
@@ -309,6 +333,26 @@ zip-output:
 	@echo ""
 	@echo "  ✓ pokerStats-output.zip"
 	@ls -lh pokerStats-output.zip
+
+# zip-cfr: just the CFR blueprint (download after CPU step, upload to GPU step)
+zip-cfr:
+	@rm -f pokerStats-cfr.zip
+	zip -r pokerStats-cfr.zip \
+		checkpoints/cfr/ \
+		-x "*/__pycache__/*"
+	@echo ""
+	@echo "  ✓ pokerStats-cfr.zip (upload this to GPU instance before ppo-*)"
+	@ls -lh pokerStats-cfr.zip
+
+# zip-ppo: just the PPO network (download after GPU step)
+zip-ppo:
+	@rm -f pokerStats-ppo.zip
+	zip -r pokerStats-ppo.zip \
+		checkpoints/*.pt \
+		-x "*/__pycache__/*"
+	@echo ""
+	@echo "  ✓ pokerStats-ppo.zip (trained network, ready to deploy)"
+	@ls -lh pokerStats-ppo.zip
 
 count_lines:
 	@find ./ -name '*.py' -exec  wc -l {} \; | sort -n| awk \

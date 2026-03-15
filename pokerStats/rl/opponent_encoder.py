@@ -175,35 +175,40 @@ class OpponentEncoder(nn.Module):
         Returns: (batch, LATENT_DIM) — opponent latent vector
         """
         batch_size, seq_len, _ = events.shape
+        latent_dim = self.output_proj[0].out_features
 
-        # Check for fully-padded sequences (no history yet)
-        # The transformer crashes if ALL positions are masked, so return zeros
+        # Which rows have at least one real event?
         has_valid = (~padding_mask).any(dim=1)  # (batch,)
+
+        # If no rows have history, return zeros (no transformer needed)
         if not has_valid.any():
-            return torch.zeros(batch_size, self.output_proj[0].out_features,
-                               device=events.device)
+            return torch.zeros(batch_size, latent_dim, device=events.device)
+
+        # Only run transformer on rows with real history — avoids NaN from
+        # fully-padded rows during backprop through attention weights
+        valid_idx = has_valid.nonzero(as_tuple=True)[0]
+        valid_events = events[valid_idx]       # (n_valid, seq, EVENT_DIM)
+        valid_mask = padding_mask[valid_idx]    # (n_valid, seq)
 
         # Project events
-        x = self.event_proj(events)  # (batch, seq, d_model)
+        x = self.event_proj(valid_events)  # (n_valid, seq, d_model)
 
         # Add positional embeddings
         positions = torch.arange(seq_len, device=events.device)
         x = x + self.pos_embed(positions).unsqueeze(0)
 
-        # For fully-padded rows, unmask position 0 so transformer doesn't crash
-        safe_mask = padding_mask.clone()
-        fully_padded = padding_mask.all(dim=1)
-        safe_mask[fully_padded, 0] = False
-
-        # Transformer with padding mask
-        x = self.transformer(x, src_key_padding_mask=safe_mask)
+        # Transformer with padding mask (no fully-padded rows in this subset)
+        x = self.transformer(x, src_key_padding_mask=valid_mask)
 
         # Pool: mean over non-padded positions
-        mask_expanded = (~padding_mask).unsqueeze(-1).float()  # (batch, seq, 1)
-        n_valid = mask_expanded.sum(dim=1).clamp(min=1)  # (batch, 1)
-        pooled = (x * mask_expanded).sum(dim=1) / n_valid  # (batch, d_model)
+        mask_expanded = (~valid_mask).unsqueeze(-1).float()  # (n_valid, seq, 1)
+        n_valid_tokens = mask_expanded.sum(dim=1).clamp(min=1)  # (n_valid, 1)
+        pooled = (x * mask_expanded).sum(dim=1) / n_valid_tokens  # (n_valid, d_model)
 
-        # Zero out fully-padded rows
-        pooled[fully_padded] = 0.0
+        valid_latents = self.output_proj(pooled)  # (n_valid, latent_dim)
 
-        return self.output_proj(pooled)  # (batch, latent_dim)
+        # Stitch back: zeros for empty-history rows, encoder output for valid rows
+        output = torch.zeros(batch_size, latent_dim, device=events.device)
+        output[valid_idx] = valid_latents
+
+        return output

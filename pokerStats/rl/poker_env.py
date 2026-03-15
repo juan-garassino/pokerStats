@@ -784,8 +784,14 @@ class PokerEnv:
         c.starting_stack = self.starting_stack
         c.small_blind    = self.small_blind
         c.big_blind      = self.big_blind
+        c.base_small_blind = self.base_small_blind
+        c.base_big_blind   = self.base_big_blind
         c.render_mode    = "none"
         c.max_raises     = self.max_raises
+        c.min_stack      = self.min_stack
+        c.max_stack      = self.max_stack
+        c.tournament_len = self.tournament_len
+        c.blind_schedule = self.blind_schedule
         c.players        = [copy.copy(p) for p in self.players]
         for p in c.players:
             p.hole_cards = list(p.hole_cards)
