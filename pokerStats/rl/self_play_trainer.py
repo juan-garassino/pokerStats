@@ -257,6 +257,8 @@ class MultiAgentTrainer:
         self.reward_hist  = [deque(maxlen=1000) for _ in range(self.num_players)]
         self.win_hist     = deque(maxlen=1000)
         self.best_elo     = 1500.0
+        self._last_eval_bb100 = 0.0
+        self._last_eval_winrate = 0.0
         self.last_metrics = {}
         self.ppo_updates  = 0
         self.t_start      = None
@@ -401,6 +403,10 @@ class MultiAgentTrainer:
         hand_start_ptrs = [buf.ptr for buf in self.buffers]
 
         self._prev_potential = {i: 0.0 for i in range(self.num_players)}
+        # Per-hand tracking for strategic reward shaping
+        self._hand_street_entry = {i: -1 for i in range(self.num_players)}  # last street player acted on
+        self._hand_preflop_raiser = None   # who raised preflop (for c-bet detection)
+        self._hand_actions_per_street = {i: {s: [] for s in range(4)} for i in range(self.num_players)}
         self._assign_seat_agents()
 
         # CFR action history for blueprint lookup (shared across all seats)
@@ -455,33 +461,65 @@ class MultiAgentTrainer:
 
                 raw_reward = np.clip(rewards.get(pidx, 0.0), -200.0, 200.0)
 
-                # Potential-based reward shaping (PBRS)
-                hs = o[155]  # hand strength at obs index 155, NOT 143
-                committed = self.env.players[pidx].total_bet / self.env.starting_stack
-                potential = hs * committed * 2.0
+                # ── Hand strength & stack context ──
+                hs = o[155]  # hand strength at obs index 155
+                player = self.env.players[pidx]
+                total_stack = player.stack + player.total_bet
+                street = self.env.street_idx  # 0=pre, 1=flop, 2=turn, 3=river
 
+                # Track per-street actions for strategic bonuses
+                self._hand_actions_per_street[pidx][street].append(action)
+                if action == Action.RAISE and street == 0:
+                    self._hand_preflop_raiser = pidx
+
+                # ── 1) PBRS: potential-based reward shaping ──
+                committed = player.total_bet / self.env.starting_stack
+                potential = hs * committed * 2.0
                 prev_pot = self._prev_potential.get(pidx, 0.0)
-                shaping = self.cfg["gamma"] * potential - prev_pot
+                pbrs = self.cfg["gamma"] * potential - prev_pot
                 self._prev_potential[pidx] = potential
 
-                # Fold equity bonus stays
+                # ── 2) Chip-risk shaping: dynamic, proportional to stake × quality ──
+                # Core principle: chips risked should correlate with hand strength
+                # Naturally handles every situation — small bets ≈ no effect,
+                # big bets amplify the signal
+                bet_shaping = 0.0
+                if action in (Action.RAISE, Action.ALL_IN):
+                    stake = player.total_bet / max(total_stack, 1.0)
+                    quality = hs - 0.5  # -0.5 (junk) to +0.5 (nuts)
+                    bet_shaping = stake * quality * 1.5
+
+                # ── 3) Strategic bonuses (hardcoded, small, per-street) ──
+                strategy_bonus = 0.0
+
+                # Fold equity: winning without showdown
                 if done and raw_reward > 0 and not info.get("showdown", False):
-                    raw_reward += 0.5
+                    strategy_bonus += 0.5
 
-                # All-in shaping: reward scales with hand strength
-                # Strong hand (hs>0.7) + all-in = small bonus (good leverage)
-                # Weak hand (hs<0.3) + all-in = penalty (reckless shove)
-                # This teaches WHEN to go all-in, not to avoid it entirely
-                allin_shaping = 0.0
-                if action == Action.ALL_IN:
-                    # Asymmetric: harsh penalty for bad all-ins, moderate bonus for good ones
-                    # hs=0.0 → -1.0, hs=0.5 → -0.2, hs=0.7 → +0.1, hs=1.0 → +0.4
-                    if hs < 0.5:
-                        allin_shaping = (hs - 0.5) * 2.0   # range: -1.0 to 0.0
-                    else:
-                        allin_shaping = (hs - 0.5) * 0.8   # range: 0.0 to +0.4
+                # Preflop: folding junk saves chips (hs < 0.3)
+                if street == 0 and action == Action.FOLD and hs < 0.3:
+                    strategy_bonus += 0.15
 
-                reward = raw_reward + shaping * 0.5 + allin_shaping
+                # Flop: continuation bet by preflop raiser (aggression continuity)
+                if street == 1 and action == Action.RAISE and self._hand_preflop_raiser == pidx:
+                    strategy_bonus += 0.2
+
+                # Turn/River: sustained aggression with strong hands (barreling)
+                if street >= 2 and action == Action.RAISE and hs > 0.6:
+                    # Raised on previous street too? That's a proper barrel
+                    prev_street_actions = self._hand_actions_per_street[pidx].get(street - 1, [])
+                    if Action.RAISE in prev_street_actions or Action.ALL_IN in prev_street_actions:
+                        strategy_bonus += 0.25
+
+                # Pot control: checking medium hands (avoid bloating pot with marginal holdings)
+                if action == Action.CHECK and 0.3 < hs < 0.6 and street >= 1:
+                    strategy_bonus += 0.1
+
+                # Surviving to showdown with strong hand (extracting value, not scaring away)
+                if done and info.get("showdown", False) and hs > 0.7 and raw_reward > 0:
+                    strategy_bonus += 0.3
+
+                reward = raw_reward + pbrs * 0.5 + bet_shaping + strategy_bonus
 
                 # CFR distillation target
                 cfr_target = None
@@ -539,13 +577,18 @@ class MultiAgentTrainer:
         if not self.league.members:
             return self.agent.elo
 
+        num_players = self.cfg["num_players"]
+        bb = self.cfg["big_blind"]
         eval_env = PokerEnv(
-            num_players    = self.cfg["num_players"],
+            num_players    = num_players,
             starting_stack = self.cfg["starting_stack"],
-            big_blind      = self.cfg["big_blind"],
+            big_blind      = bb,
         )
         hero_elo = self.agent.elo
-        wins = losses = 0
+
+        # Track bb/100 (profit in big blinds per 100 hands) — the gold standard
+        total_profit = 0.0
+        wins = 0
 
         for _ in range(n_hands):
             obs  = eval_env.reset()
@@ -562,17 +605,30 @@ class MultiAgentTrainer:
                     action, rf, _, _, _ = opp.get_action(o, mask, deterministic=True)
                 obs, rewards, done, _ = eval_env.step(action, rf)
 
-            if rewards.get(0, 0.0) > 0:
+            hero_reward = rewards.get(0, 0.0)
+            total_profit += hero_reward
+            if hero_reward > 0:
                 wins += 1
-            else:
-                losses += 1
 
-        win_rate = wins / max(wins + losses, 1)
+        # bb/100: standard poker performance metric
+        bb_per_100 = (total_profit / max(bb, 1.0)) / max(n_hands, 1) * 100
+
+        # ELO update based on bb/100 performance:
+        # Map bb/100 to a "score" between 0 and 1
+        #   bb/100 = 0   → score = 0.5 (break-even = expected for equal skill)
+        #   bb/100 = +10 → score ≈ 0.73 (solid winner)
+        #   bb/100 = -10 → score ≈ 0.27 (solid loser)
+        #   Clamped to [0.05, 0.95] to prevent ELO explosions
+        score = 1 / (1 + 10 ** (-bb_per_100 / 15))  # sigmoid centered at 0
+        score = max(0.05, min(0.95, score))
+
         opp_elo  = np.mean([m["elo"] for m in self.league.members])
-
         expected = 1 / (1 + 10 ** ((opp_elo - hero_elo) / 400))
-        hero_elo += 32 * (win_rate - expected)
+        hero_elo += 32 * (score - expected)
+
         self.agent.elo = hero_elo
+        self._last_eval_bb100 = bb_per_100
+        self._last_eval_winrate = wins / max(n_hands, 1)
         return hero_elo
 
     # ── Main training loop ────────────────────────────────────────────────
@@ -652,7 +708,10 @@ class MultiAgentTrainer:
                     old_elo = self.agent.elo
                     new_elo = self._eval_elo(self.cfg["eval_hands"])
                     gain    = new_elo - old_elo
-                    print(f"\n  ELO eval: {old_elo:.0f} \u2192 {new_elo:.0f}  ({gain:+.1f})", flush=True)
+                    eval_bb = getattr(self, '_last_eval_bb100', 0.0)
+                    eval_wr = getattr(self, '_last_eval_winrate', 0.0)
+                    print(f"\n  ELO eval: {old_elo:.0f} \u2192 {new_elo:.0f}  ({gain:+.1f})"
+                          f"  |  eval bb/100: {eval_bb:+.1f}  win: {eval_wr:.1%}", flush=True)
 
                     if phase >= 2 and gain >= self.cfg["min_elo_gain"]:
                         self.league.add(
