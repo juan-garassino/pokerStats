@@ -30,6 +30,15 @@ CFG = {
     "starting_stack":   200.0,
     "big_blind":        2.0,
     "render_every":     5000,    # render table every N hands
+    "tournament_len":   100,     # hard reset every N hands (new session)
+    # Blind schedule: list of (hand_threshold, sb, bb) or None for flat blinds
+    # Thresholds are relative to tournament start. Set to None to disable.
+    "blind_schedule":   [
+        (0,  1.0,  2.0),    # Level 1: 1/2
+        (25, 2.0,  4.0),    # Level 2: 2/4
+        (50, 3.0,  6.0),    # Level 3: 3/6
+        (75, 5.0, 10.0),    # Level 4: 5/10
+    ],
 
     # Rollout
     "rollout_steps":    1024,    # steps per PPO update (lower = more frequent updates)
@@ -47,9 +56,9 @@ CFG = {
     # Exploration noise for non-hero seats
     "opp_epsilon":      0.10,    # probability of random action for opponents
     "opp_epsilon_decay": 0.9999, # decay per hand
-    "temperature_start": 2.0,
+    "temperature_start": 1.5,
     "temperature_end":   0.5,
-    "temperature_anneal_hands": 200_000,
+    "temperature_anneal_hands": 0,  # 0 = auto (50% of total hands)
 
     # Self-play
     "self_play_update_freq":  500,
@@ -208,6 +217,8 @@ class MultiAgentTrainer:
             big_blind      = cfg["big_blind"],
             render_mode    = "none",
         )
+        self.env.tournament_len = cfg.get("tournament_len", 100)
+        self.env.blind_schedule = cfg.get("blind_schedule", None)
         self.num_players = cfg["num_players"]
 
         # One shared agent (AlphaPokerNet)
@@ -427,8 +438,7 @@ class MultiAgentTrainer:
                 # Temperature schedule
                 t = min(1.0, self.hand_num / self.cfg.get("temperature_anneal_hands", 200_000))
                 hero_temp = self.cfg.get("temperature_start", 2.0) * (1 - t) + self.cfg.get("temperature_end", 0.5) * t
-                opp_temp = hero_temp * 1.5
-
+                opp_temp = hero_temp * 1.2  # slight exploration for opponents
                 temp = hero_temp if pidx == 0 else opp_temp
                 action, raise_frac, log_prob, value, entropy = \
                     self.agent.get_action(o, mask,
@@ -443,10 +453,10 @@ class MultiAgentTrainer:
                                      self.env.pot, self.env.street_idx)
                 self._fill_action_targets(pidx, action)
 
-                raw_reward = np.clip(rewards.get(pidx, 0.0), -10.0, 10.0)
+                raw_reward = np.clip(rewards.get(pidx, 0.0), -200.0, 200.0)
 
                 # Potential-based reward shaping (PBRS)
-                hs = o[143]
+                hs = o[155]  # hand strength at obs index 155, NOT 143
                 committed = self.env.players[pidx].total_bet / self.env.starting_stack
                 potential = hs * committed * 2.0
 
@@ -559,6 +569,9 @@ class MultiAgentTrainer:
         print(f"  AlphaPoker Multi-Agent Training")
         print(f"  Device: {self.agent.device}")
         total = self.cfg['phase1_hands'] + self.cfg['phase2_hands'] + self.cfg['phase3_hands']
+        # Auto-set temperature anneal to 50% of total hands if not specified
+        if self.cfg.get("temperature_anneal_hands", 0) <= 0:
+            self.cfg["temperature_anneal_hands"] = total // 2
         print(f"  Total hands: {total:,}")
         print(f"  Seats: {self.num_players} (all learning, shared weights)")
         if self.blueprint_teacher is not None:

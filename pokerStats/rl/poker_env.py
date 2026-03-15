@@ -265,8 +265,18 @@ class PokerEnv:
         self.starting_stack = starting_stack
         self.small_blind    = small_blind
         self.big_blind      = big_blind
+        self.base_small_blind = small_blind
+        self.base_big_blind   = big_blind
         self.render_mode    = render_mode
         self.max_raises     = max_raises
+        # Stack bounds: rebuy below min, trim above max (prevents accumulation)
+        self.min_stack      = big_blind * 10      # 10 BB — short-stack floor
+        self.max_stack      = starting_stack * 3   # 300 BB — deep-stack ceiling
+        self.tournament_len = 100                  # hard reset every N hands (new session)
+        # Optional blind escalation (tournament-style)
+        # List of (hand_threshold, sb, bb) — blinds increase at each threshold
+        # Thresholds are relative to tournament start (0 = first hand of session)
+        self.blind_schedule = None  # set externally to enable
 
         # Gym spaces
         if GYM_OK:
@@ -312,7 +322,11 @@ class PokerEnv:
         random.shuffle(self.deck)
 
         # Reset players (or create them)
-        if not self.players:
+        new_tournament = (self.hand_num % self.tournament_len == 0)
+        if not self.players or new_tournament:
+            # New session — reset blinds to base level
+            self.small_blind = self.base_small_blind
+            self.big_blind   = self.base_big_blind
             self.players = [
                 Player(idx=i, stack=self.starting_stack)
                 for i in range(self.num_players)
@@ -324,9 +338,22 @@ class PokerEnv:
                 p.total_bet   = 0.0
                 p.folded      = False
                 p.all_in      = False
-                # Rebuy if busted
-                if p.stack < self.big_blind:
+                # Rebuy if short-stacked, trim if deep-stacked.
+                # Keeps stacks in a realistic range so the agent learns
+                # both deep-stack and short-stack play without accumulation.
+                if p.stack < self.min_stack:
                     p.stack = self.starting_stack
+                elif p.stack > self.max_stack:
+                    p.stack = self.max_stack
+
+        # Blind escalation (tournament-style, optional)
+        if self.blind_schedule is not None:
+            hands_into_session = self.hand_num % self.tournament_len
+            for threshold, sb, bb in self.blind_schedule:
+                if hands_into_session >= threshold:
+                    self.small_blind = sb
+                    self.big_blind   = bb
+            self.last_bet = self.big_blind
 
         # Deal hole cards
         for p in self.players:
@@ -650,7 +677,7 @@ class PokerEnv:
         v[52:104] = cards_to_onehot(self.community)
 
         # Player slots padded to MAX_PLAYERS=9 (empty seats stay zero)
-        max_stack = self.starting_stack * 2
+        max_stack = self.max_stack
 
         # [104:113] normalized stacks
         for i, pl in enumerate(self.players):
@@ -704,6 +731,9 @@ class PokerEnv:
             v[159] = call_amt / (self.pot + call_amt)
         else:
             v[159] = 0.0
+
+        # Safety clamp — prevents numerical overflow in the network
+        np.clip(v, -10.0, 10.0, out=v)
 
         return v
 
