@@ -230,13 +230,17 @@ def render_training_stats(stats: dict) -> str:
     # Auxiliary losses (AlphaPoker)
     aux_card  = stats.get("aux_card_loss", 0)
     aux_range = stats.get("aux_range_loss", 0)
+    cfr_loss  = stats.get("cfr_loss", 0)
     aux_str = ""
     if aux_card > 0 or aux_range > 0:
         aux_str = f"  aux_c={aux_card:.4f}  aux_r={aux_range:.4f}"
+    cfr_str = ""
+    if cfr_loss > 0:
+        cfr_str = f"  cfr={cfr_loss:.4f}"
 
     line2 = (
         f"    {GRAY}ploss={ploss:+.4f}  vloss={vloss:.4f}  "
-        f"ent={ent:.3f}{aux_str}  updates={upd}  "
+        f"ent={ent:.3f}{aux_str}{cfr_str}  updates={upd}  "
         f"{hps:.1f} hands/s  [{pct:.0f}%]{RESET}"
     )
     return f"{line1}\n{line2}"

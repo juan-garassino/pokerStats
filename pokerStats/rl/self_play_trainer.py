@@ -50,7 +50,7 @@ CFG = {
     # Optimization
     "lr":               2.5e-4,
     "clip_eps":         0.2,
-    "entropy_coef":     0.08,    # prevent entropy collapse (all-in spam)
+    "entropy_coef":     0.12,    # prevent entropy collapse (all-in spam)
     "value_coef":       0.5,
 
     # Exploration noise for non-hero seats
@@ -262,6 +262,8 @@ class MultiAgentTrainer:
         self.last_metrics = {}
         self.ppo_updates  = 0
         self.t_start      = None
+        self._cfr_hits    = 0
+        self._cfr_lookups = 0
 
         # Scripted agents for phase 3
         self._scripted_seats = {}  # seat_idx -> ScriptedAgent (or None)
@@ -269,7 +271,6 @@ class MultiAgentTrainer:
         # Exploration noise — decays over training
         self.opp_epsilon = cfg.get("opp_epsilon", 0.15)
         self.opp_epsilon_decay = cfg.get("opp_epsilon_decay", 0.9999)
-        self._prev_potential = {}
 
         # Add initial random opponent to league
         rng_agent = PPOAgent(use_alpha=True,
@@ -402,7 +403,6 @@ class MultiAgentTrainer:
         # Record buffer positions at hand start for showdown targets
         hand_start_ptrs = [buf.ptr for buf in self.buffers]
 
-        self._prev_potential = {i: 0.0 for i in range(self.num_players)}
         # Per-hand tracking for strategic reward shaping
         self._hand_street_entry = {i: -1 for i in range(self.num_players)}  # last street player acted on
         self._hand_preflop_raiser = None   # who raised preflop (for c-bet detection)
@@ -462,9 +462,12 @@ class MultiAgentTrainer:
                 raw_reward = np.clip(rewards.get(pidx, 0.0), -200.0, 200.0)
 
                 # ── Hand strength & stack context ──
-                hs = o[155]  # hand strength at obs index 155
+                hs = o[155]              # hand strength
+                pot_odds = o[159]        # pot odds from obs
                 player = self.env.players[pidx]
                 total_stack = player.stack + player.total_bet
+                bb = self.cfg["big_blind"]
+                stack_bb = total_stack / max(bb, 1.0)
                 street = self.env.street_idx  # 0=pre, 1=flop, 2=turn, 3=river
 
                 # Track per-street actions for strategic bonuses
@@ -472,54 +475,83 @@ class MultiAgentTrainer:
                 if action == Action.RAISE and street == 0:
                     self._hand_preflop_raiser = pidx
 
-                # ── 1) PBRS: potential-based reward shaping ──
-                committed = player.total_bet / self.env.starting_stack
-                potential = hs * committed * 2.0
-                prev_pot = self._prev_potential.get(pidx, 0.0)
-                pbrs = self.cfg["gamma"] * potential - prev_pot
-                self._prev_potential[pidx] = potential
+                # ── Layer 2: Decision quality (EV-based) ──
+                decision_ev = 0.0
 
-                # ── 2) Chip-risk shaping: dynamic, proportional to stake × quality ──
-                # Core principle: chips risked should correlate with hand strength
-                # Naturally handles every situation — small bets ≈ no effect,
-                # big bets amplify the signal
-                bet_shaping = 0.0
-                if action in (Action.RAISE, Action.ALL_IN):
-                    stake = player.total_bet / max(total_stack, 1.0)
-                    quality = hs - 0.5  # -0.5 (junk) to +0.5 (nuts)
-                    bet_shaping = stake * quality * 1.5
+                if action == Action.CALL:
+                    # Calling when equity > pot odds = good
+                    decision_ev = (hs - pot_odds) * 0.5
 
-                # ── 3) Strategic bonuses (hardcoded, small, per-street) ──
+                elif action == Action.FOLD:
+                    # Folding when equity < pot odds = saved chips
+                    if pot_odds > 0:
+                        decision_ev = (pot_odds - hs) * 0.3
+                    # folding to no bet = 0 (checking was free)
+
+                elif action == Action.RAISE:
+                    # Polarization principle: raise with top/bottom of range
+                    is_value = hs > 0.7
+                    is_bluff = hs < 0.25
+                    is_medium = 0.35 < hs < 0.65
+                    if is_value or is_bluff:
+                        decision_ev = 0.2
+                    elif is_medium:
+                        decision_ev = -0.1
+
+                elif action == Action.ALL_IN:
+                    if street == 0 and stack_bb > 20:
+                        # Deep-stacked preflop shove = always bad
+                        decision_ev = -min(1.5, stack_bb / 50)
+                    elif street == 0 and stack_bb <= 20:
+                        # Short-stack shove: fine if equity is decent
+                        decision_ev = (hs - 0.4) * 0.3
+                    else:
+                        # Post-flop all-in: context-dependent
+                        if hs > 0.8:
+                            decision_ev = 0.3    # value shove with near-nuts
+                        elif hs < 0.2:
+                            decision_ev = 0.1    # bluff shove with no showdown value
+                        else:
+                            decision_ev = -0.2   # medium hand all-in post-flop = bad
+
+                # ── Layer 3: Strategic bonuses ──
                 strategy_bonus = 0.0
+
+                # Preflop raise sizing (2-5x BB = good, >10x = fishy)
+                if street == 0 and action == Action.RAISE:
+                    raise_bb = player.total_bet / max(bb, 1.0)
+                    if 2 <= raise_bb <= 5:
+                        strategy_bonus += 0.15
+                    elif raise_bb > 10:
+                        strategy_bonus -= 0.3
+
+                # Street progression (THE key anti-shove incentive)
+                if done:
+                    strategy_bonus += 0.15 * street
 
                 # Fold equity: winning without showdown
                 if done and raw_reward > 0 and not info.get("showdown", False):
-                    strategy_bonus += 0.5
+                    strategy_bonus += 0.3
 
-                # Preflop: folding junk saves chips (hs < 0.3)
-                if street == 0 and action == Action.FOLD and hs < 0.3:
-                    strategy_bonus += 0.15
-
-                # Flop: continuation bet by preflop raiser (aggression continuity)
+                # C-bet by preflop raiser
                 if street == 1 and action == Action.RAISE and self._hand_preflop_raiser == pidx:
                     strategy_bonus += 0.2
 
-                # Turn/River: sustained aggression with strong hands (barreling)
+                # Barreling with strong hands
                 if street >= 2 and action == Action.RAISE and hs > 0.6:
-                    # Raised on previous street too? That's a proper barrel
-                    prev_street_actions = self._hand_actions_per_street[pidx].get(street - 1, [])
-                    if Action.RAISE in prev_street_actions or Action.ALL_IN in prev_street_actions:
+                    prev = self._hand_actions_per_street[pidx].get(street - 1, [])
+                    if Action.RAISE in prev or Action.ALL_IN in prev:
                         strategy_bonus += 0.25
 
-                # Pot control: checking medium hands (avoid bloating pot with marginal holdings)
+                # Pot control with medium hands
                 if action == Action.CHECK and 0.3 < hs < 0.6 and street >= 1:
                     strategy_bonus += 0.1
 
-                # Surviving to showdown with strong hand (extracting value, not scaring away)
+                # Showdown value extraction
                 if done and info.get("showdown", False) and hs > 0.7 and raw_reward > 0:
                     strategy_bonus += 0.3
 
-                reward = raw_reward + pbrs * 0.5 + bet_shaping + strategy_bonus
+                reward = raw_reward + decision_ev + strategy_bonus
 
                 # CFR distillation target
                 cfr_target = None
@@ -530,6 +562,9 @@ class MultiAgentTrainer:
                     cfr_target, has_cfr = self.blueprint_teacher.get_target(
                         hole, community, cfr_action_history
                     )
+                    self._cfr_lookups += 1
+                    if has_cfr:
+                        self._cfr_hits += 1
 
                 self.buffers[pidx].add(
                     o, action, raise_frac, log_prob, reward, value,
@@ -697,7 +732,9 @@ class MultiAgentTrainer:
                         "ppo_updates": self.ppo_updates,
                         **self.last_metrics,
                     }
-                    print(render_training_stats(stats), flush=True)
+                    cfr_rate = self._cfr_hits / max(self._cfr_lookups, 1)
+                    cfr_note = f"  cfr_hit: {cfr_rate:.0%}" if self._cfr_lookups > 0 else ""
+                    print(render_training_stats(stats) + cfr_note, flush=True)
 
                 if self.hand_num % 5000 == 0 and self.population:
                     for pop_agent in self.population:
