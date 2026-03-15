@@ -53,6 +53,7 @@ PHASE1_HANDS ?= 20000
 PHASE2_HANDS ?= 50000
 PHASE3_HANDS ?= 20000
 NUM_PLAYERS ?= 6
+RENDER_EVERY ?= 5000
 
 train-colab:
 ifeq ($(USE_CFR),1)
@@ -62,7 +63,7 @@ ifeq ($(USE_CFR),1)
 		CFG['phase1_hands']=$(PHASE1_HANDS); \
 		CFG['phase2_hands']=$(PHASE2_HANDS); \
 		CFG['phase3_hands']=$(PHASE3_HANDS); \
-		CFG['render_every']=999999; \
+		CFG['render_every']=$(RENDER_EVERY); \
 		teacher = BlueprintTeacher('$(CFR_BLUEPRINT)', '$(CFR_ABSTRACTION)'); \
 		MultiAgentTrainer(CFG, blueprint_teacher=teacher).train()"
 else
@@ -71,7 +72,7 @@ else
 		CFG['phase1_hands']=$(PHASE1_HANDS); \
 		CFG['phase2_hands']=$(PHASE2_HANDS); \
 		CFG['phase3_hands']=$(PHASE3_HANDS); \
-		CFG['render_every']=999999; \
+		CFG['render_every']=$(RENDER_EVERY); \
 		MultiAgentTrainer(CFG).train()"
 endif
 
@@ -130,25 +131,44 @@ train-unified-6max:
 train-unified-8max:
 	$(MAKE) train-unified NUM_PLAYERS=8
 
-# ── Colab one-shot: fresh training from scratch ──────────
-# Single command that does everything: CFR → PPO+distillation
-# Quick (~30 min on Colab GPU)
-train-unified-colab-quick:
-	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=5000 CFR_RENDER=1000 CFR_LOG=500
+# ── Step 1: CFR on CPU (cheap Colab instance, no GPU needed) ──
+# Run this first, then `make zip-output` to download blueprint
+# Benchmark: 5k iters = 4 hours on Colab CPU (0.5 iter/s)
+cfr-cpu-quick:
+	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=500 CFR_RENDER=250 CFR_LOG=250
+
+cfr-cpu:
+	$(MAKE) cfr-train CFR_BUCKETS=20 CFR_SAMPLES=500 CFR_ITERS=1000 CFR_RENDER=500 CFR_LOG=500
+
+cfr-cpu-full:
+	$(MAKE) cfr-train CFR_BUCKETS=30 CFR_SAMPLES=500 CFR_ITERS=3000 CFR_RENDER=1000 CFR_LOG=1000
+
+# ── Step 2: PPO+distillation on GPU (needs blueprint from step 1) ──
+# Upload blueprint via zip-output from step 1, then run this
+ppo-gpu-quick:
 	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
 		PHASE1_HANDS=5000 PHASE2_HANDS=10000 PHASE3_HANDS=5000
 
-# Medium (~2-3 hours on Colab GPU)
-train-unified-colab:
-	$(MAKE) cfr-train CFR_BUCKETS=50 CFR_SAMPLES=1000 CFR_ITERS=50000 CFR_RENDER=10000 CFR_LOG=5000
+ppo-gpu:
 	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
 		PHASE1_HANDS=20000 PHASE2_HANDS=50000 PHASE3_HANDS=20000
 
-# Full (~6-8 hours on Colab GPU)
-train-unified-colab-full:
-	$(MAKE) cfr-train CFR_BUCKETS=200 CFR_SAMPLES=10000 CFR_ITERS=500000 CFR_RENDER=50000 CFR_LOG=25000
+ppo-gpu-full:
 	$(MAKE) train-colab NUM_PLAYERS=$(NUM_PLAYERS) USE_CFR=1 \
 		PHASE1_HANDS=50000 PHASE2_HANDS=200000 PHASE3_HANDS=50000
+
+# ── All-in-one (if you want both on same instance) ──────
+train-unified-colab-quick:
+	$(MAKE) cfr-cpu-quick
+	$(MAKE) ppo-gpu-quick
+
+train-unified-colab:
+	$(MAKE) cfr-cpu
+	$(MAKE) ppo-gpu
+
+train-unified-colab-full:
+	$(MAKE) cfr-cpu-full
+	$(MAKE) ppo-gpu-full
 
 # Watch random agent play 10 hands (no checkpoint needed)
 demo:
@@ -244,6 +264,27 @@ cfr-test-kuhn:
 # Run CFR tests only
 cfr-test:
 	python -m pytest tests/test_abstraction.py tests/test_cfr_solver.py tests/test_hybrid_agent.py -v --tb=short
+
+# ── Zip repo (upload to Colab) ───────────────────────────
+zip-repo:
+	@rm -f pokerStats-repo.zip
+	zip -r pokerStats-repo.zip \
+		pokerStats/ scripts/ tests/ reference/ \
+		Makefile setup.py requirements.txt CLAUDE.md \
+		-x "*/__pycache__/*" "*.pyc" "*/.DS_Store"
+	@echo ""
+	@echo "  ✓ pokerStats-repo.zip"
+	@ls -lh pokerStats-repo.zip
+
+# ── Zip outputs (download from Colab) ───────────────────
+zip-output:
+	@rm -f pokerStats-output.zip
+	zip -r pokerStats-output.zip \
+		checkpoints/ data/ \
+		-x "*/__pycache__/*"
+	@echo ""
+	@echo "  ✓ pokerStats-output.zip"
+	@ls -lh pokerStats-output.zip
 
 count_lines:
 	@find ./ -name '*.py' -exec  wc -l {} \; | sort -n| awk \
